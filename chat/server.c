@@ -181,9 +181,372 @@ static void models(int fd) {
     free(b.p);
 }
 
-static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char* body, size_t n) {
-    (void)cfg, (void)st, (void)body, (void)n;
-    reply_error(fd, 400, "invalid_request_error", "chat completions are not available yet");
+// ---- the JSON parser: reads the request in place, keeping only the fields the server uses -----------------------
+
+typedef struct {
+    const char* p;
+    const char* end;
+    int depth;
+} Json;
+
+static void j_ws(Json* j) {
+    while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) j->p++;
+}
+
+static int j_peek(Json* j) {
+    j_ws(j);
+    return j->p < j->end ? (unsigned char)*j->p : -1;
+}
+
+static int j_eat(Json* j, char c) {
+    if (j_peek(j) != c) return 0;
+    j->p++;
+    return 1;
+}
+
+static void put_utf8(Buf* b, uint32_t c) {
+    char u[4];
+    int n;
+    if (c < 0x80) u[0] = (char)c, n = 1;
+    else if (c < 0x800) u[0] = (char)(0xC0 | c >> 6), u[1] = (char)(0x80 | (c & 63)), n = 2;
+    else if (c < 0x10000)
+        u[0] = (char)(0xE0 | c >> 12), u[1] = (char)(0x80 | (c >> 6 & 63)), u[2] = (char)(0x80 | (c & 63)), n = 3;
+    else
+        u[0] = (char)(0xF0 | c >> 18), u[1] = (char)(0x80 | (c >> 12 & 63)), u[2] = (char)(0x80 | (c >> 6 & 63)),
+        u[3] = (char)(0x80 | (c & 63)), n = 4;
+    if (b) buf_put(b, u, n);
+}
+
+static int j_hex4(Json* j, uint32_t* v) {
+    if (j->end - j->p < 4) return 0;
+    *v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = *j->p++;
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0) return 0;
+        *v = *v << 4 | d;
+    }
+    return 1;
+}
+
+// A string, decoded into out (NULL = skipped). 1 = ok.
+static int j_str(Json* j, Buf* out) {
+    if (!j_eat(j, '"')) return 0;
+    while (j->p < j->end) {
+        const char* run = j->p;
+        while (j->p < j->end && *j->p != '"' && *j->p != '\\' && (unsigned char)*j->p >= 0x20) j->p++;
+        if (out && j->p > run) buf_put(out, run, j->p - run);
+        if (j->p >= j->end || (unsigned char)*j->p < 0x20) return 0;
+        char c = *j->p++;
+        if (c == '"') return 1;
+        if (j->p >= j->end) return 0;
+        c = *j->p++;
+        uint32_t u;
+        switch (c) {
+        case '"': case '\\': case '/': if (out) buf_put(out, &c, 1); break;
+        case 'b': put_utf8(out, 8); break;
+        case 'f': put_utf8(out, 12); break;
+        case 'n': put_utf8(out, 10); break;
+        case 'r': put_utf8(out, 13); break;
+        case 't': put_utf8(out, 9); break;
+        case 'u':
+            if (!j_hex4(j, &u)) return 0;
+            if (u >= 0xD800 && u < 0xDC00) {   // a surrogate pair, else U+FFFD
+                uint32_t lo;
+                if (j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+                    const char* back = j->p;
+                    j->p += 2;
+                    if (j_hex4(j, &lo) && lo >= 0xDC00 && lo < 0xE000) u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+                    else j->p = back, u = 0xFFFD;
+                } else
+                    u = 0xFFFD;
+            } else if (u >= 0xDC00 && u < 0xE000)
+                u = 0xFFFD;
+            put_utf8(out, u);
+            break;
+        default: return 0;
+        }
+    }
+    return 0;
+}
+
+static int j_num(Json* j, double* v) {
+    j_ws(j);
+    const char* s0 = j->p;
+    while (j->p < j->end && strchr("+-0123456789.eE", *j->p)) j->p++;
+    size_t n = j->p - s0;
+    if (!n || n > 63) return 0;
+    char t[64];
+    memcpy(t, s0, n);
+    t[n] = 0;
+    char* e;
+    *v = strtod(t, &e);
+    return *e == 0;
+}
+
+static int j_lit(Json* j, const char* w) {
+    size_t n = strlen(w);
+    j_ws(j);
+    if ((size_t)(j->end - j->p) < n || memcmp(j->p, w, n)) return 0;
+    j->p += n;
+    return 1;
+}
+
+static int j_skip(Json* j) {
+    int c = j_peek(j);
+    if (c == '"') return j_str(j, NULL);
+    if (c == '{' || c == '[') {
+        if (++j->depth > 64) return 0;
+        j->p++;
+        char close = c == '{' ? '}' : ']';
+        if (!j_eat(j, close)) {
+            do {
+                if (c == '{' && (!j_str(j, NULL) || !j_eat(j, ':'))) return 0;
+                if (!j_skip(j)) return 0;
+            } while (j_eat(j, ','));
+            if (!j_eat(j, close)) return 0;
+        }
+        j->depth--;
+        return 1;
+    }
+    if (c == 't') return j_lit(j, "true");
+    if (c == 'f') return j_lit(j, "false");
+    if (c == 'n') return j_lit(j, "null");
+    double v;
+    return j_num(j, &v);
+}
+
+// Walks an object: for every key calls field(j, key, user), which reads the value (0 = bad). 1 = ok.
+static int j_object(Json* j, int (*field)(Json*, const char*, void*), void* user) {
+    if (!j_eat(j, '{')) return 0;
+    if (j_eat(j, '}')) return 1;
+    do {
+        Buf key = {0};
+        int ok = j_str(j, &key) && j_eat(j, ':') && field(j, key.p ? key.p : "", user);
+        free(key.p);
+        if (!ok) return 0;
+    } while (j_eat(j, ','));
+    return j_eat(j, '}');
+}
+
+// ---- the request ---------------------------------------------------------------------------------------------------
+
+enum { ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT };
+static const char* const role_names[] = {"system", "user", "assistant"};
+
+typedef struct {
+    int role;
+    Buf text;
+} Message;
+
+typedef struct {
+    Message* msg;
+    int n, cap;
+    double temperature;
+    long max_tokens, max_completion;   // -1 = absent
+    int stream, seed, has_seed;
+} Request;
+
+typedef struct {
+    Buf type, text;
+} Part;
+
+static int part_field(Json* j, const char* key, void* user) {
+    Part* p = user;
+    if (!strcmp(key, "type")) return j_peek(j) == '"' ? j_str(j, &p->type) : j_skip(j);
+    if (!strcmp(key, "text")) return j_peek(j) == '"' ? j_str(j, &p->text) : j_skip(j);
+    return j_skip(j);
+}
+
+static int content(Json* j, Buf* out) {
+    int c = j_peek(j);
+    if (c == '"') return j_str(j, out);
+    if (c != '[') return j_skip(j);   // null or anything else: no text
+    j->p++;
+    if (j_eat(j, ']')) return 1;
+    do {
+        Part p = {{0}, {0}};
+        int ok = j_peek(j) == '{' ? j_object(j, part_field, &p) : j_skip(j);
+        if (ok && p.type.p && !strcmp(p.type.p, "text") && p.text.n) buf_put(out, p.text.p, p.text.n);
+        free(p.type.p), free(p.text.p);
+        if (!ok) return 0;
+    } while (j_eat(j, ','));
+    return j_eat(j, ']');
+}
+
+static int message_field(Json* j, const char* key, void* user) {
+    Message* m = user;
+    if (!strcmp(key, "content")) return content(j, &m->text);
+    if (!strcmp(key, "role")) {
+        Buf r = {0};
+        if (j_peek(j) != '"') return j_skip(j);
+        int ok = j_str(j, &r);
+        const char* s = r.p ? r.p : "";
+        m->role = !strcmp(s, "system") || !strcmp(s, "developer") ? ROLE_SYSTEM : !strcmp(s, "assistant") ? ROLE_ASSISTANT : ROLE_USER;
+        free(r.p);
+        return ok;
+    }
+    return j_skip(j);
+}
+
+static int messages(Json* j, Request* r) {
+    if (!j_eat(j, '[')) return 0;
+    if (j_eat(j, ']')) return 1;
+    do {
+        if (r->n == r->cap) {
+            int cap = r->cap ? r->cap * 2 : 16;
+            Message* m = realloc(r->msg, cap * sizeof(Message));
+            if (!m) return 0;
+            r->msg = m, r->cap = cap;
+        }
+        Message* m = &r->msg[r->n++];
+        memset(m, 0, sizeof(*m));
+        m->role = ROLE_USER;
+        if (!j_object(j, message_field, m)) return 0;
+    } while (j_eat(j, ','));
+    return j_eat(j, ']');
+}
+
+static int request_field(Json* j, const char* key, void* user) {
+    Request* r = user;
+    double v;
+    if (j_peek(j) == 'n') return j_lit(j, "null");   // null = absent
+    if (!strcmp(key, "messages")) return messages(j, r);
+    if (!strcmp(key, "stream")) {
+        if (j_lit(j, "true")) r->stream = 1;
+        else if (j_lit(j, "false")) r->stream = 0;
+        else return 0;
+        return 1;
+    }
+    if (!strcmp(key, "temperature") || !strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens") ||
+        !strcmp(key, "seed")) {
+        if (!j_num(j, &v)) return 0;
+        if (key[0] == 't') r->temperature = v;
+        else if (key[0] == 's') r->seed = (int)(long long)v, r->has_seed = 1;
+        else if (!strcmp(key, "max_tokens")) r->max_tokens = v < 0 ? 0 : v > 1e9 ? 1000000000L : (long)v;
+        else r->max_completion = v < 0 ? 0 : v > 1e9 ? 1000000000L : (long)v;
+        return 1;
+    }
+    return j_skip(j);
+}
+
+static void request_free(Request* r) {
+    for (int i = 0; i < r->n; i++) free(r->msg[i].text.p);
+    free(r->msg);
+}
+
+// ---- chat completions ------------------------------------------------------------------------------------------
+
+static int leaving;   // frame asked to leave while a request ran: the reply ends, then server mode
+
+// The prompt as the chat renders it: every message, then a new assistant turn; returns its length.
+static int render(ServerConfig* cfg, const Request* r, uint32_t* ids, int max) {
+    int n = 0;
+    for (int i = 0; i <= r->n && n < max - 16; i++) {
+        int role = i < r->n ? r->msg[i].role : ROLE_ASSISTANT;
+        ids[n++] = cfg->im_start;
+        n = cfg->encode(ids, n, max - 16, role_names[role]);
+        n = cfg->encode(ids, n, max - 16, "\n");
+        if (role == ROLE_ASSISTANT) {   // the empty think block: the answer without thinking
+            ids[n++] = cfg->think;
+            n = cfg->encode(ids, n, max - 16, "\n\n");
+            ids[n++] = cfg->think_end;
+            n = cfg->encode(ids, n, max - 16, "\n\n");
+        }
+        if (i == r->n) break;
+        if (r->msg[i].text.p) n = cfg->encode(ids, n, max - 16, r->msg[i].text.p);
+        ids[n++] = cfg->im_end;
+        n = cfg->encode(ids, n, max - 16, "\n");
+    }
+    return n;
+}
+
+typedef struct {
+    Buf text;           // the reply so far
+    int completion;     // tokens sent as text
+} Out;
+
+static void emit(ServerConfig* cfg, Out* o, uint32_t token) {
+    const uint8_t* bytes;
+    int nb = tok_piece(cfg->tok, token, &bytes);
+    if (nb > 0) buf_put(&o->text, (const char*)bytes, nb);
+    o->completion++;
+}
+
+// Prompt, then one token per call until a stop. 0 = done (*finish set), -1 = engine error (eng->error).
+static int generate(ServerConfig* cfg, ServerStatus* st, const uint32_t* ids, int n, int max_new, float temperature,
+                    uint32_t seed, Out* o, const char** finish) {
+    Engine* e = cfg->eng;
+    uint32_t next;
+    engine_reset(e);
+    if (engine_run(e, ids, n, 0, temperature, seed++, &next)) return -1;
+    int pos = n;
+    for (;;) {
+        if (next == cfg->im_end || next == e->eos2) {
+            *finish = "stop";
+            return 0;
+        }
+        if (o->completion >= max_new || pos >= (int)e->ctx_limit - 1 || leaving) {
+            *finish = "length";
+            return 0;
+        }
+        emit(cfg, o, next);
+        if (cfg->frame(cfg->user, st)) leaving = 1;
+        uint32_t t = next;
+        if (engine_run(e, &t, 1, pos, temperature, seed++, &next)) return -1;
+        pos++;
+    }
+}
+
+static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char* body, size_t len) {
+    Engine* e = cfg->eng;
+    Request r = {NULL, 0, 0, 0.7, -1, -1, 0, 0, 0};
+    Json j = {body, body + len, 0};
+    if (!j_object(&j, request_field, &r) || j_peek(&j) != -1) {
+        reply_error(fd, 400, "invalid_request_error", "the body is not valid JSON");
+        request_free(&r);
+        return;
+    }
+    if (!r.n) {
+        reply_error(fd, 400, "invalid_request_error", "messages is missing or empty");
+        request_free(&r);
+        return;
+    }
+    int max = (int)e->ctx_limit + 32;
+    uint32_t* ids = malloc(max * sizeof(uint32_t));
+    int n = ids ? render(cfg, &r, ids, max) : max;
+    if (n >= (int)e->ctx_limit - 1) {
+        reply_error(fd, 400, "invalid_request_error", "the prompt does not fit the context");
+        free(ids);
+        request_free(&r);
+        return;
+    }
+    float temperature = r.temperature < 0 ? 0.0f : r.temperature > 1.5 ? 1.5f : (float)r.temperature;
+    long want = r.max_completion >= 0 ? r.max_completion : r.max_tokens >= 0 ? r.max_tokens : cfg->max_reply;
+    int max_new = want < (long)e->ctx_limit - 1 - n ? (int)want : (int)e->ctx_limit - 1 - n;
+    uint32_t seed = r.has_seed ? (uint32_t)r.seed : (uint32_t)st->served + 1;
+    Out o = {{0}, 0};
+    const char* finish = "stop";
+    double t0 = now_s();
+    if (generate(cfg, st, ids, n, max_new, temperature, seed, &o, &finish)) {
+        reply_error(fd, 500, "server_error", e->error);
+    } else {
+        Buf b = {0};
+        buf_printf(&b, "{\"id\":\"chatcmpl-%d\",\"object\":\"chat.completion\",\"created\":%d,\"model\":\"%s\","
+                       "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":", st->served + 1,
+                   CREATED, MODEL_ID);
+        json_str(&b, o.text.p ? o.text.p : "", o.text.n);
+        buf_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+                       "\"total_tokens\":%d}}", finish, n, o.completion, n + o.completion);
+        reply_json(fd, 200, &b);
+        free(b.p);
+        double dt = now_s() - t0;
+        say("server: %d messages, prompt %d tokens, reply %d tokens (%s) in %.1f s (%.1f tokens/s)", r.n, n,
+            o.completion, finish, dt, dt > 0 ? o.completion / dt : 0.0);
+    }
+    free(o.text.p);
+    free(ids);
+    request_free(&r);
 }
 
 // ---- one connection --------------------------------------------------------------------------------------------
@@ -327,6 +690,7 @@ int server_run(ServerConfig* cfg) {
         free(c.buf);
         return -1;
     }
+    leaving = 0;
     net_ip(st.ip);
     say("server: listening on %s:%d", st.ip[0] ? st.ip : "0.0.0.0", SERVER_PORT);
     for (int turn = 1;; turn++) {
@@ -339,7 +703,7 @@ int server_run(ServerConfig* cfg) {
             }
         }
         if (c.fd >= 0) conn_step(cfg, &st, &c);
-        if (cfg->frame(cfg->user, &st)) break;
+        if (leaving || cfg->frame(cfg->user, &st)) break;
     }
     conn_close(&c);
     sceNetSocketClose(ls);
