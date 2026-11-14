@@ -3,8 +3,9 @@
 The app itself is built by build_chat.py. The tools are expected in toolchain/ (or in the folder named by the
 GARLIC_TOOLCHAIN environment variable):
   OpenOrbis/PS4Toolchain   the OpenOrbis PS4 Toolchain (headers, libraries, link script, package tools)
-  zig/zig.exe              Zig: its clang and lld compile the app and the GPU kernels
-  dotnet/dotnet.exe        the .NET runtime that OpenOrbis' PkgTool needs
+  zig/zig(.exe)            Zig: its clang and lld compile the app and the GPU kernels
+  dotnet/dotnet(.exe)      the .NET runtime that OpenOrbis' PkgTool needs
+Windows, macOS and Linux hosts each use their own OpenOrbis bin/<os> tools.
 """
 
 import ftplib
@@ -16,9 +17,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TOOLCHAIN = Path(os.environ.get("GARLIC_TOOLCHAIN") or ROOT / "toolchain")
 OO = TOOLCHAIN / "OpenOrbis" / "PS4Toolchain"
-ZIG = TOOLCHAIN / "zig" / "zig.exe"
-DOTNET = TOOLCHAIN / "dotnet" / "dotnet.exe"
-BIN = OO / "bin" / "windows"
+HOST = "windows" if sys.platform == "win32" else "macos" if sys.platform == "darwin" else "linux"
+EXE = ".exe" if HOST == "windows" else ""
+ZIG = TOOLCHAIN / "zig" / ("zig" + EXE)
+DOTNET = TOOLCHAIN / "dotnet" / ("dotnet" + EXE)
+BIN = OO / "bin" / HOST
+PKGTOOL = OO / "bin" / "windows" / "PkgTool.Core.dll"   # the .NET build; only bin/windows ships the .dll
 BUILD = ROOT / "build"
 PKGDIR = BUILD / "pkg"
 
@@ -39,7 +43,15 @@ def run(cmd, **kw):
 
 
 def pkgtool(*args):
-    run([DOTNET, BIN / "PkgTool.Core.dll", *args], cwd=PKGDIR)
+    run([DOTNET, PKGTOOL, *args], cwd=PKGDIR)
+
+
+def require_tools(*paths):
+    """Stop with one message naming every tool that is missing."""
+    missing = [p for p in paths if not Path(p).is_file()]
+    if missing:
+        sys.exit(f"Missing build tools (looked under {TOOLCHAIN}; set GARLIC_TOOLCHAIN to use another folder):\n"
+                 + "".join(f"  {p}\n" for p in missing))
 
 
 def ps4_ftp(timeout=30):
