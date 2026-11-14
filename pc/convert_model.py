@@ -6,6 +6,7 @@
 All q4 (pc/q4.py), no q3. Needs numpy only; reads the safetensors files with numpy.memmap.
 
   .venv/bin/python pc/convert_model.py models/Qwen3.5-2B [--id qwen3.5-2b]    -> models/ps4/<id>/
+  .venv/bin/python pc/convert_model.py ~/models/Qwen3.5-4B-UD-Q6_K_XL.gguf --id=qwen3.5-4b   (a GGUF: GGUFCheckpoint)
 """
 import json
 import struct
@@ -58,16 +59,112 @@ class Checkpoint:
         raise ValueError(f"{name}: dtype {e['dtype']}")
 
 
+class GGUFCheckpoint:
+    """A Qwen3.5 GGUF (llama.cpp's "qwen35", any of its quant types) as Checkpoint gives the safetensors: the Hugging
+    Face names and layout. llama.cpp stores the norms as 1 + w, A_log as -exp(A_log), and, when there are more value
+    heads than key heads, the value heads tiled (GGUF head j = HF head (j % n_kh) * r + j // n_kh, r = n_vh / n_kh);
+    all of that is undone here. .config: the config.json fields main() reads."""
+
+    def __init__(self, path):
+        import convert_gguf
+        self.meta, self.t, self.mm = convert_gguf.gguf(path)
+        self.tensor = convert_gguf.tensor
+        m, A = self.meta, "qwen35."
+        nl = m[A + "block_count"] - m.get(A + "nextn_predict_layers", 0)
+        hd, nk, nv = m[A + "attention.key_length"], m[A + "ssm.group_count"], m[A + "ssm.time_step_rank"]
+        self.config = dict(
+            model_type="qwen3_5_text", num_hidden_layers=nl, hidden_size=m[A + "embedding_length"],
+            intermediate_size=m[A + "feed_forward_length"], num_attention_heads=m[A + "attention.head_count"],
+            num_key_value_heads=m[A + "attention.head_count_kv"], head_dim=hd,
+            rms_norm_eps=m[A + "attention.layer_norm_rms_epsilon"],
+            rope_parameters=dict(rope_theta=m[A + "rope.freq_base"],
+                                 partial_rotary_factor=m[A + "rope.dimension_count"] / hd),
+            linear_num_key_heads=nk, linear_num_value_heads=nv, linear_key_head_dim=m[A + "ssm.state_size"],
+            linear_value_head_dim=m[A + "ssm.inner_size"] // nv, linear_conv_kernel_dim=m[A + "ssm.conv_kernel"],
+            layer_types=["full_attention" if (i + 1) % m[A + "full_attention_interval"] == 0 else "linear_attention"
+                         for i in range(nl)],
+            mtp_num_hidden_layers=m.get(A + "nextn_predict_layers", 0))
+        self.nl, self.nk, self.nv = nl, nk, nv
+        self.dk, self.dv = self.config["linear_key_head_dim"], self.config["linear_value_head_dim"]
+        r = nv // nk   # HF value head h = GGUF head perm[h]
+        self.perm = np.array([(h % r) * nk + h // r for h in range(nv)])
+
+    def where(self, name):
+        """(GGUF name, what to undo): "norm" (1 + w), "A" (-exp), "v_rows" / "v_cols" / "v" (value head order)."""
+        P, L = "model.language_model.", "model.language_model.layers."
+        if name == P + "embed_tokens.weight": return "token_embd.weight", None
+        if name == P + "norm.weight": return "output_norm.weight", "norm"
+        if name == "lm_head.weight": return "output.weight", None
+        if name.startswith("mtp."):   # the MTP head: llama.cpp's "nextn" layer after the model's own
+            b = f"blk.{self.nl}."
+            top = {"mtp.fc.weight": ("nextn.eh_proj.weight", None),
+                   "mtp.pre_fc_norm_embedding.weight": ("nextn.enorm.weight", "norm"),
+                   "mtp.pre_fc_norm_hidden.weight": ("nextn.hnorm.weight", "norm"),
+                   "mtp.norm.weight": ("nextn.shared_head_norm.weight", "norm")}
+            if name in top: return b + top[name][0], top[name][1]
+            name, i = L + "x." + name[len("mtp.layers.0."):], self.nl
+        else:
+            i = int(name[len(L):].split(".")[0])
+        k = name[len(L):].split(".", 1)[1]
+        b = f"blk.{i}."
+        m = {"input_layernorm.weight": ("attn_norm.weight", "norm"),
+             "post_attention_layernorm.weight": ("post_attention_norm.weight", "norm"),
+             "mlp.gate_proj.weight": ("ffn_gate.weight", None), "mlp.up_proj.weight": ("ffn_up.weight", None),
+             "mlp.down_proj.weight": ("ffn_down.weight", None),
+             "self_attn.q_proj.weight": ("attn_q.weight", None), "self_attn.k_proj.weight": ("attn_k.weight", None),
+             "self_attn.v_proj.weight": ("attn_v.weight", None), "self_attn.o_proj.weight": ("attn_output.weight", None),
+             "self_attn.q_norm.weight": ("attn_q_norm.weight", "norm"),
+             "self_attn.k_norm.weight": ("attn_k_norm.weight", "norm"),
+             "linear_attn.A_log": ("ssm_a", "A"), "linear_attn.dt_bias": ("ssm_dt.bias", "v"),
+             "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", "v"),
+             "linear_attn.in_proj_b.weight": ("ssm_beta.weight", "v"),
+             "linear_attn.in_proj_qkv.weight": ("attn_qkv.weight", "qkv"),
+             "linear_attn.in_proj_z.weight": ("attn_gate.weight", "v_rows"),
+             "linear_attn.conv1d.weight": ("ssm_conv1d.weight", "qkv"),
+             "linear_attn.norm.weight": ("ssm_norm.weight", None),
+             "linear_attn.out_proj.weight": ("ssm_out.weight", "v_cols")}[k]
+        return b + m[0], m[1]
+
+    def __contains__(self, name):
+        try:
+            return self.where(name)[0] in self.t
+        except (KeyError, ValueError):
+            return False
+
+    def __getitem__(self, name):
+        g, undo = self.where(name)
+        w = self.tensor(self.t, self.mm, g)
+        if undo == "norm":
+            return w - 1.0
+        if undo == "A":
+            return np.log(-w[self.perm])
+        if undo == "v":   # one row per value head
+            return w[self.perm]
+        heads = lambda n: (self.perm[:, None] * self.dv + np.arange(self.dv)).reshape(-1) + n   # noqa: E731
+        if undo == "v_rows":
+            return w[heads(0)]
+        if undo == "v_cols":
+            return w[:, heads(0)]
+        if undo == "qkv":   # q | k rows as they are, then the value heads
+            qk = 2 * self.nk * self.dk
+            return np.concatenate([w[:qk], w[heads(qk)]])   # (conv1d: [channels][taps], main() reshapes it)
+        return w
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    src = Path(args[0])
+    src = Path(args[0]).expanduser()
     mid = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--id=")), src.name.lower())
     out_dir = ROOT / "models" / "ps4" / mid   # (not next to the source: a Mac disk ignores case)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cfg = json.loads((src / "config.json").read_text())
-    c = cfg.get("text_config", cfg)
+    if src.suffix == ".gguf":
+        ck = GGUFCheckpoint(src)
+        c = ck.config
+    else:
+        cfg = json.loads((src / "config.json").read_text())
+        c = cfg.get("text_config", cfg)
+        ck = Checkpoint(src)
     assert c["model_type"] == "qwen3_5_text", c["model_type"]
-    ck = Checkpoint(src)
     keep = np.load(KEEP).astype(np.int64)
     P = "model.language_model."
     nh, hd = c["num_attention_heads"], c["head_dim"]
