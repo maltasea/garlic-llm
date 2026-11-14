@@ -26,7 +26,8 @@ typedef enum {
     S_HOLD_LONGER, S_PREPARING, S_LOADING_MODEL, S_LOADING_VOICE, S_ERROR_TITLE, S_ERROR_HINT, S_OFFLINE,
     S_SYSTEM_PROMPT, S_LOCAL_GPU, S_PY_RUN, S_PY_EXIT, S_PY_CLICK, S_PY_RCLICK, S_PY_MOVE, S_PY_KEYS, S_PY_BACK,
     S_PY_AGAIN, S_PY_FIX, S_PY_DONE, S_PY_ERROR, S_PY_STOPPED, S_PY_STARTING, S_PY_FIX_MSG, S_PY_FIX_ASK, S_PY_INPUT, S_VOICE_MODE, S_THINKING, S_LISTENING_SHORT, S_VOICE_LOADING, S_VOICE_NO_TTS,
-    S_THINK_OFF_HINT, S_THINK_ON_HINT, S_THINK_ON_TOAST, S_THINK_OFF_TOAST, S_THOUGHT, S_THINK_CUT, S_THINK_CHIP, N_STRINGS
+    S_THINK_OFF_HINT, S_THINK_ON_HINT, S_THINK_ON_TOAST, S_THINK_OFF_TOAST, S_THOUGHT, S_THINK_CUT, S_THINK_CHIP,
+    S_SERVER_TITLE, S_SERVER_IDLE, S_SERVER_BUSY, S_SERVER_HINT, N_STRINGS
 } StrId;
 const char* tr(StrId id);
 
@@ -142,3 +143,6 @@ void draw_run_intro(const char* title, float t);                 // transition f
 // ---- voice mode: talk to Garlic without the chat; only its words are shown ----
 enum { VM_IDLE, VM_LISTEN, VM_THINK, VM_SPEAK };
 void draw_voice_mode(int state, const char* reply, float level, double time);
+
+// ---- server mode: the OpenAI-compatible API (server.c); busy 1 while request number served is answered ----
+void draw_server(const char* ip, int port, int busy, int served);

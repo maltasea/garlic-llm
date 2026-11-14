@@ -175,6 +175,15 @@ static const char* strings[N_STRINGS][N_LANGS] = {
                    "Думал %d с · токенов: %d"},
     [S_THINK_CUT] = {"tope alcanzado", "limit reached", "limite atingido", "лимит"},
     [S_THINK_CHIP] = {"Pensar", "Think", "Pensar", "Думать"},
+    // server mode (L3)
+    [S_SERVER_TITLE] = {"Servidor API", "API server", "Servidor API", "API-сервер"},
+    [S_SERVER_IDLE] = {"Esperando peticiones…", "Waiting for requests…", "Aguardando pedidos…", "Жду запросов…"},
+    [S_SERVER_BUSY] = {"Respondiendo la petición %d…", "Answering request %d…", "Respondendo ao pedido %d…",
+                       "Отвечаю на запрос %d…"},
+    [S_SERVER_HINT] = {"En tu cliente OpenAI, usa la URL base http://%s:%d/v1",
+                       "In your OpenAI client, set the base URL to http://%s:%d/v1",
+                       "No seu cliente OpenAI, use a URL base http://%s:%d/v1",
+                       "В клиенте OpenAI укажите базовый URL http://%s:%d/v1"},
 };
 
 const char* tr(StrId id) { return strings[id][ui_lang] ? strings[id][ui_lang] : strings[id][LANG_EN]; }
@@ -2131,6 +2140,25 @@ void draw_confirm(const char* text) {
     no_clip();
     const Hint hh[] = {{BTN_CROSS, S_SEND}, {BTN_TRIANGLE, S_EDIT}, {BTN_SQUARE, S_RETRY}, {BTN_CIRCLE, S_DISCARD}};
     draw_footer(hh, 4, NULL);
+}
+
+// ---- server mode ------------------------------------------------------------------------------------------------
+
+void draw_server(const char* ip, int port, int busy, int served) {
+    if (!ip || !*ip) ip = "0.0.0.0";
+    draw_background();
+    brand_block(170);
+    int cx = SCREEN_W / 2, y = 470;
+    char t[160];
+    draw_center(&font_small, cx, y, tr(S_SERVER_TITLE), C_ACCENT_HI);
+    snprintf(t, sizeof(t), "http://%s:%d/v1", ip, port);
+    draw_center(&font_big, cx, y + 60, t, 0xFFFFFF);
+    snprintf(t, sizeof(t), tr(busy ? S_SERVER_BUSY : S_SERVER_IDLE), served);
+    draw_center(&font_small, cx, y + 60 + font_big.line + 30, t, busy ? C_ACCENT_HI : C_TEXT_DIM);
+    snprintf(t, sizeof(t), tr(S_SERVER_HINT), ip, port);
+    draw_center(&font_small, cx, y + 60 + font_big.line + 90, t, C_TEXT_MUTED);
+    const Hint hh[] = {{BTN_CIRCLE, S_PY_BACK}};
+    draw_footer(hh, 1, NULL);
 }
 
 #include "ui_run.inc"
