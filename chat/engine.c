@@ -301,7 +301,9 @@ static int load_kernels(Engine* e, const char* dir) {
     static const char* pf_names[7] = {"mm_q4i_rows", "mm_q3i_rows", "rmsnorm_rows", "silu_mul_rows",
                                       "mul_sigmoid_rows", "conv_silu_rows", "delta_rows"};
     const GpuKernel** pf_k[7] = {&e->k_mm4r, &e->k_mm3r, &e->k_rmsr, &e->k_silur, &e->k_sigr, &e->k_convr, &e->k_deltar};
-    e->pf = e->qwen35 && (e->cpu_embed || e->k_embed);
+    e->pf = (e->qwen35 || e->lfm) && (e->cpu_embed || e->k_embed);
+    if (e->lfm && !(e->k_shortr = kernel(e, "short_conv_rows")))
+        e->pf = 0, e->error[0] = 0;   // (an older LFM2 kernels.bin: the prompt token by token)
     for (int j = 0; j < 7; j++) {
         *pf_k[j] = NULL;
         for (int i = 0; i < e->nk; i++)
@@ -553,7 +555,7 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
     // the batched prompt: q4i / q3i matrices (rows in tiles of 64), and PF_ROWS rows of each buffer (5.8 MiB for the 9B)
     uint64_t pf_wa = 0, pf_wh = 0;
     for (uint32_t i = 0; e->pf && i < e->n_layers; i++) {
-        uint32_t b = e->layer_base[i], full = e->full_mask >> i & 1;
+        uint32_t b = e->layer_base[i], full = (e->full_mask >> i & 1) || e->lfm;   // (LFM2: the same 8 slots)
         uint32_t m[4] = {b + (full ? 4 : 2), b + (full ? 5 : 7), b + (full ? 6 : 8), b + (full ? 7 : 9)};
         for (int j = 0; j < 4; j++) {
             const Tensor* t = &e->t[m[j]];
@@ -979,10 +981,14 @@ static void prefill(Engine* e, uint64_t stage, const uint32_t* tokens, uint32_t 
     for (uint32_t i = 0; i < e->n_layers; i++) {
         uint32_t b = e->layer_base[i];
         int full = e->full_mask >> i & 1;
-        uint32_t mlp = b + (full ? 6 : 8);
+        uint32_t mlp = b + (full || e->lfm ? 6 : 8);
         uint64_t kc = e->kc[i], vc = e->vc[i];
         dispatch(e, e->k_rmsr, args(e, "pppuf", e->pf_x, W(e, b), e->pf_xn, H, (double)e->eps), n, 256);
-        if (!full) {   // Gated DeltaNet: input projection, conv + delta rule over the tokens in order, out projection
+        if (!full && e->lfm) {   // short conv: B | C | x for all, the conv over the tokens in order, out projection
+            mmr(e, b + 4, e->pf_xn, e->pf_a, n, 0);
+            dispatch(e, e->k_shortr, args(e, "ppppuu", e->pf_a, W(e, b + 2), kc, e->pf_h, H, n), H / 256, 256);
+            mmr(e, b + 5, e->pf_h, e->pf_x, n, 1);
+        } else if (!full) {   // Gated DeltaNet: input projection, conv + delta rule over the tokens in order, out projection
             uint32_t ld = e->t[b + 2].rows;
             mmr(e, b + 2, e->pf_xn, e->pf_a, n, 0);
             dispatch(e, e->k_convr, args(e, "pppuuu", e->pf_a, W(e, b + 3), kc, (uint32_t)e->conv_n, ld, n),
@@ -1003,10 +1009,15 @@ static void prefill(Engine* e, uint64_t stage, const uint32_t* tokens, uint32_t 
                              args(e, "pppppppuuufp", q, W(e, b + 2), W(e, b + 3), e->rope, kc, vc, e->tq_tab, pos0 + r,
                                   e->n_heads, e->n_kv, (double)e->eps, e->tq_split),
                              G, 64);
-                else
+                else if (e->qwen35)
                     dispatch(e, e->k_qk,
                              args(e, "ppppppuuufp", q, W(e, b + 2), W(e, b + 3), e->rope, kc, vc, pos0 + r, e->n_heads,
                                   e->n_kv, (double)e->eps, e->kv_split),
+                             G, 64);
+                else   // (as step(): no split argument)
+                    dispatch(e, e->k_qk,
+                             args(e, "ppppppuuuf", q, W(e, b + 2), W(e, b + 3), e->rope, kc, vc, pos0 + r, e->n_heads,
+                                  e->n_kv, (double)e->eps),
                              G, 64);
             }
             for (uint32_t r = 0; r < n; r++) {   // token r sees positions up to its own (all written above)
@@ -1021,8 +1032,9 @@ static void prefill(Engine* e, uint64_t stage, const uint32_t* tokens, uint32_t 
                              e->n_heads, 256);
                 } else {
                     dispatch(e, e->k_attn,
-                             args(e, "pppppuuufp", q, kc, vc, e->attn_part, out, pos, e->n_heads, e->n_kv, sc,
-                                  e->kv_split),
+                             e->qwen35 ? args(e, "pppppuuufp", q, kc, vc, e->attn_part, out, pos, e->n_heads, e->n_kv,
+                                              sc, e->kv_split)
+                                       : args(e, "pppppuuuf", q, kc, vc, e->attn_part, out, pos, e->n_heads, e->n_kv, sc),
                              blocks * e->n_kv, 256);
                     if (blocks > 1)
                         dispatch(e, e->k_attn_comb, args(e, "ppuu", e->attn_part, out, e->n_heads, blocks), e->n_heads,
@@ -1030,7 +1042,8 @@ static void prefill(Engine* e, uint64_t stage, const uint32_t* tokens, uint32_t 
                 }
             }
             uint64_t gate = e->pf_a + (uint64_t)(e->n_heads + 2 * e->n_kv) * e->head_dim * 4;
-            dispatch(e, e->k_sigr, args(e, "ppuuu", e->pf_h, gate, nq, ld, n), (n * nq + 255) / 256, 256);
+            if (e->qwen35)   // (Qwen3.5's output gate)
+                dispatch(e, e->k_sigr, args(e, "ppuuu", e->pf_h, gate, nq, ld, n), (n * nq + 255) / 256, 256);
             mmr(e, b + 5, e->pf_h, e->pf_x, n, 1);
         }
         dispatch(e, e->k_rmsr, args(e, "pppuf", e->pf_x, W(e, b + 1), e->pf_xn, H, (double)e->eps), n, 256);
@@ -1296,7 +1309,7 @@ static void mm_tune(Engine* e) {
     e->pf_nmm = 0;
     if (!e->pf) return;
     for (uint32_t i = 0; i < e->n_layers && e->pf_nmm < 8; i++) {
-        uint32_t b = e->layer_base[i], full = e->full_mask >> i & 1;
+        uint32_t b = e->layer_base[i], full = (e->full_mask >> i & 1) || e->lfm;
         uint32_t m[4] = {b + (full ? 4 : 2), b + (full ? 5 : 7), b + (full ? 6 : 8), b + (full ? 7 : 9)};
         for (int j = 0; j < 4 && e->pf_nmm < 8; j++) {
             const Tensor* t = &e->t[m[j]];

@@ -27,3 +27,29 @@ void short_conv(global float* in, global const float* w, global float* state, ui
     s[0] = s1;
     s[1] = bx;
 }
+
+#ifdef PREFILL   // LFM2: the prompt in batches (chat/engine.c prefill; the DeltaNet kernels there go unused)
+#define DK 128
+#define DV 128
+#include "prefill.h"
+
+// short_conv for `rows` consecutive tokens: in rows of 3n (B | C | x), out rows of n; the state stays in registers.
+kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void short_conv_rows(global const float* in, global const float* w, global float* state, global float* out, uint n,
+                     uint rows) {
+    uint c = GID * 256 + LID;
+    if (c >= n) return;
+    global float* s = state + 2 * (ulong)c;
+    global const float* wc = w + 3 * (ulong)c;
+    float w0 = wc[0], w1 = wc[1], w2 = wc[2], s0 = s[0], s1 = s[1];
+    for (uint t = 0; t < rows; t++) {
+        global const float* r = in + (ulong)t * 3 * n;
+        float bx = r[c] * r[2 * n + c];
+        out[(ulong)t * n + c] = r[n + c] * (w0 * s0 + w1 * s1 + w2 * bx);
+        s0 = s1;
+        s1 = bx;
+    }
+    s[0] = s0;
+    s[1] = s1;
+}
+#endif

@@ -84,6 +84,7 @@ typedef struct {
     int pf, pf_off;               // batched prompt available; pf_off = 1: token by token (tests)
     uint64_t pf_x, pf_xn, pf_a, pf_h;
     const GpuKernel *k_mm4r, *k_mm3r, *k_rmsr, *k_silur, *k_sigr, *k_convr, *k_deltar;
+    const GpuKernel* k_shortr;   // LFM2: short_conv_rows
     double pf_seconds;            // GPU time of the last batched prompt (diagnostics)
     uint64_t submit_tsc;          // when the last submission went to the GPU (submit_go)
     // the fastest product kernel for each matrix shape, timed at start-up (engine.c mm_tune): [0] for batches of

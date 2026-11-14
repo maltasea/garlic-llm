@@ -23,7 +23,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-from q4 import quantize_q4_mse  # noqa: E402
+from q4 import interleave_q4, quantize_q4_mse  # noqa: E402
 
 CHAT_SEQ = 32768  # an LFM2 context (fp16 KV cache of its 8 attention layers: 16 KiB per token, 512 MiB)
 EMB_SEQ = 1024   # tokens per input (the KV cache: 28 layers x 2 x 1024 x 8 heads x 128 x fp16 = 112 MiB)
@@ -123,7 +123,7 @@ def tokenizer(meta, out):
 
 
 def kernels(out, defines):
-    """shaders/qwen3.cl with these -D's (MAX_SEQ, HEAD_DIM) -> kernels.bin (as export_chat.py)."""
+    """shaders/qwen3.cl with these -D's (MAX_SEQ, HEAD_DIM, PREFILL) -> kernels.bin (as export_chat.py)."""
     import gpu
     obj = out / "qwen3.o"
     flags = [f"-D{d}" for d in defines]
@@ -187,8 +187,12 @@ def main():
             copied.append(key)
         else:
             packed, d16 = quantize_q4_mse(np.concatenate([get(n) for n in names]))
-        put(key, packed.tobytes() + d16.tobytes(), rows=packed.shape[0], cols=packed.shape[1] * 2,
-            scales=packed.nbytes, fmt=2)
+        if lfm:   # q4i (the same values, rows in tiles of 64): the batched prompt's matrix kernels read it
+            nib, sc = interleave_q4(packed, d16)
+            put(key, nib + sc, rows=packed.shape[0], cols=packed.shape[1] * 2, scales=len(nib), fmt=3)
+        else:
+            put(key, packed.tobytes() + d16.tobytes(), rows=packed.shape[0], cols=packed.shape[1] * 2,
+                scales=packed.nbytes, fmt=2)
 
     q4("embed", "token_embd.weight")
     f32("final_norm", get("token_embd_norm.weight" if lfm else "output_norm.weight"))
@@ -233,7 +237,7 @@ def main():
     print(f"\n{mid}/weights.bin: {size / 2**20:.0f} MiB ({n_layers} layers, hidden {hidden}, heads {n_heads}/{n_kv} x "
           f"{head_dim})")
     tokenizer(meta, out)
-    kernels(out, [f"MAX_SEQ={seq}"] + ([f"HEAD_DIM={head_dim}"] if lfm else []))
+    kernels(out, [f"MAX_SEQ={seq}"] + ([f"HEAD_DIM={head_dim}", "PREFILL"] if lfm else []))
 
 
 if __name__ == "__main__":
