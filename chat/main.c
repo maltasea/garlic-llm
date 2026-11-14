@@ -4,7 +4,7 @@
 //
 // Chat: Cross = keyboard, hold Square = talk, Circle = stop the answer, Triangle = new conversation,
 // L2 / R2 = temperature, Up / Down = scroll, OPTIONS = system keyboard (e.g. a USB keyboard), R3 / touch pad =
-// think before answering on / off.
+// think before answering on / off, L3 = API server (server.c) until Circle.
 // The model weights live in /data (see model.idx); GPU code, tokenizer and fonts are in the package's assets.
 
 #include <math.h>
@@ -27,6 +27,7 @@
 #include "engine.h"
 #include "tokenizer.h"
 #include "pyrun.h"
+#include "server.h"
 #include "ui.h"
 
 #define ASSETS "/app0/assets"
@@ -1779,6 +1780,32 @@ static void boot_report(void) {
 }
 
 
+// ---- server mode (L3): the OpenAI-compatible API; Circle returns to a new conversation ------------------------------
+
+static int server_frame(void* user, const ServerStatus* st) {
+    static uint32_t prev = ~0u;   // (the buttons held when server mode began do not count)
+    uint32_t b = read_buttons(), pressed = b & ~prev;
+    prev = b;
+    (void)user;
+    draw_server(st->ip, st->port, st->busy, st->busy ? st->served + 1 : st->served);
+    present();
+    if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
+        prev = ~0u;
+        return 1;
+    }
+    return 0;
+}
+
+static void server_mode(void) {
+    ServerConfig cfg = {&eng, &tok, IM_START, IM_END, THINK, THINK_END, MAX_REPLY, encode_into, server_frame, NULL};
+    msgs_clear();   // the chat on the screen ends: the server uses the model's cache for its own prompts
+    pos = 0, need_close = 0, hist_n = hist_done = 0, sys_pre = 0, view.scroll = 0;
+    say("server mode");
+    if (server_run(&cfg)) say("%s", eng.error);
+    msgs_clear();
+    pos = 0, need_close = 0, sys_pre = 0;
+}
+
 int main(void) {
     if (rename(LOG_FILE, LOG_PREV)) unlink(LOG_FILE);   // the last log of this app is kept, as LOG_PREV
     say("starting");
@@ -1866,6 +1893,9 @@ int main(void) {
             prev = read_buttons();
         } else if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
             push_to_talk();
+            prev = read_buttons();
+        } else if (pressed & ORBIS_PAD_BUTTON_L3) {
+            server_mode();
             prev = read_buttons();
         } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
             msgs_clear();
