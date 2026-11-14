@@ -105,7 +105,7 @@ def main():
     sfo = "sce_sys/param.sfo"
     b.pkgtool("sfo_new", sfo)
     for key, typ, size, value in [("APP_TYPE", "Integer", 4, "1"), ("APP_VER", "Utf8", 8, VERSION),
-                                  ("ATTRIBUTE", "Integer", 4, "0"), ("CATEGORY", "Utf8", 4, "gd"),
+                                  ("ATTRIBUTE", "Integer", 4, str(0x00800000)), ("CATEGORY", "Utf8", 4, "gd"),
                                   ("CONTENT_ID", "Utf8", 48, CONTENT_ID), ("DOWNLOAD_DATA_SIZE", "Integer", 4, "0"),
                                   ("SYSTEM_VER", "Integer", 4, "0"), ("TITLE", "Utf8", 128, TITLE),
                                   ("TITLE_ID", "Utf8", 12, TITLE_ID), ("VERSION", "Utf8", 8, VERSION)]:
