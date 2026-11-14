@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <orbis/Net.h>
 #include <orbis/NetCtl.h>
 #include <orbis/libkernel.h>
@@ -442,6 +444,7 @@ static int leaving;   // frame asked to leave while a request ran: the reply end
 // sampled but never fed). A prompt that starts with exactly these is fed from where they end (server_run owns it).
 static uint32_t* cache;
 static int cached;
+static int snap_n;    // the model's state at position snap_n (the end of the last prompt) is in cfg->snap; 0 = none
 
 // The prompt as the chat renders it: every message, then a new assistant turn; returns its length.
 static int render(ServerConfig* cfg, const Request* r, uint32_t* ids, int max) {
@@ -528,13 +531,21 @@ static int generate(ServerConfig* cfg, ServerStatus* st, const uint32_t* ids, in
                     uint32_t seed, Out* o, const char** finish) {
     Engine* e = cfg->eng;
     uint32_t next;
-    int from = cached > 0 && cached < n && memcmp(ids, cache, cached * sizeof(uint32_t)) == 0 ? cached : 0;
+    // The whole cache, or the last prompt (its state saved) when the new one goes another way after it (a client
+    // that sends the reply back in other tokens, or changes it)
+    int same = 0;
+    while (same < cached && same < n && ids[same] == cache[same]) same++;
+    int from = same == cached && cached < n ? cached : 0;
+    if (!from && snap_n && snap_n <= same && snap_n < n && !engine_state_copy(e, cfg->snap, 0)) from = snap_n;
     if (!from) engine_reset(e);
-    say("server: prompt %d tokens, %d of them cached: feeding %d", n, from, n - from);
-    cached = 0;   // (valid again once the prompt is in)
+    say("server: prompt %d tokens, the first %d as before: feeding %d", n, same, n - from);
+    cached = snap_n = 0;   // (valid again once the prompt is in)
+    double t0 = now_s();
     if (engine_run(e, ids + from, n - from, from, temperature, seed++, &next)) return -1;
+    say("server: prompt in %.2f s", now_s() - t0);
     memcpy(cache, ids, n * sizeof(uint32_t));
     cached = n;
+    if (cfg->snap && !engine_state_copy(e, cfg->snap, 1)) snap_n = n;
     int pos = n;
     for (;;) {
         if (next == cfg->im_end || next == e->eos2) {
@@ -572,8 +583,31 @@ static int generate(ServerConfig* cfg, ServerStatus* st, const uint32_t* ids, in
     }
 }
 
+// /data/garlic_tune.txt, read before every request (tests without restarting the app): "<K> <theta> <wait_us>",
+// the MTP draft cap and threshold and how the CPU waits for the GPU (engine.h wait_us)
+static void tune(Engine* e) {
+    static char last[64];
+    char b[64] = {0};
+    int f = open("/data/garlic_tune.txt", O_RDONLY);
+    if (f < 0) return;
+    ssize_t n = read(f, b, sizeof(b) - 1);
+    close(f);
+    if (n <= 0 || !strcmp(b, last)) return;
+    memcpy(last, b, sizeof(last));
+    int k = -1, w = -1;
+    float th = -1.0f;
+    sscanf(b, "%d %f %d", &k, &th, &w);
+#ifdef GARLIC_SPEC
+    if (k >= 0) spec_kmax(k);
+    if (th >= 0.0f) spec_theta(th);
+#endif
+    if (w >= 0) e->wait_us = w;
+    say("server: tune K %d theta %.2f wait %d us", k, (double)th, e->wait_us);
+}
+
 static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char* body, size_t len) {
     Engine* e = cfg->eng;
+    tune(e);
     Request r = {NULL, 0, 0, 0.7, -1, -1, 0, 0, 0};
     Json j = {body, body + len, 0};
     if (!j_object(&j, request_field, &r) || j_peek(&j) != -1) {
@@ -609,8 +643,18 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
         o.gone = net_send(fd, head, sizeof(head) - 1) != 0;
         chunk(&o, first, sizeof(first) - 1, NULL, 0);
     }
+#ifdef GARLIC_SPEC
+    spec_stats_reset();
+#endif
     int failed = generate(cfg, st, ids, n, max_new, temperature, seed, &o, &finish);
-    if (failed) say("server: %s", e->error), cached = 0;
+#ifdef GARLIC_SPEC
+    if (!failed && spec_active(e)) {
+        char line[300];
+        spec_stats(e, line, sizeof(line));
+        say("server: %s", line);
+    }
+#endif
+    if (failed) say("server: %s", e->error), cached = snap_n = 0;
     if (r.stream) {
         if (!failed) {
             if (o.npend) {   // a character the reply ended in the middle of
@@ -739,9 +783,10 @@ static void route(ServerConfig* cfg, ServerStatus* st, Conn* c) {
 // One step of the open connection: reads what has arrived; a complete request is answered and the connection closed.
 static void conn_step(ServerConfig* cfg, ServerStatus* st, Conn* c) {
     size_t want = c->head ? c->head + c->body : HEAD_MAX;
-    if (c->len < want) {
+    for (int got = 0; c->len < want;) {   // all that has arrived (the loop around this sleeps when idle)
         int r = sceNetRecv(c->fd, c->buf + c->len, want - c->len, 0);
         if (r == NET_EAGAIN) {
+            if (got) break;
             if (now_s() - c->last > IDLE_S) conn_close(c);
             return;
         }
@@ -749,7 +794,7 @@ static void conn_step(ServerConfig* cfg, ServerStatus* st, Conn* c) {
             conn_close(c);
             return;
         }
-        c->len += r, c->last = now_s();
+        c->len += r, c->last = now_s(), got = 1;
         c->buf[c->len] = 0;
     }
     if (!c->head) {
@@ -789,7 +834,7 @@ int server_run(ServerConfig* cfg) {
         free(c.buf);
         return -1;
     }
-    leaving = 0, cached = 0;
+    leaving = 0, cached = snap_n = 0;
     cache = malloc((cfg->eng->ctx_limit + 32) * sizeof(uint32_t));
     if (!cache) {
         snprintf(cfg->eng->error, sizeof(cfg->eng->error), "server: no memory for the cache ids");
@@ -799,10 +844,18 @@ int server_run(ServerConfig* cfg) {
     }
     net_ip(st.ip);
     say("server: listening on %s:%d", st.ip[0] ? st.ip : "0.0.0.0", SERVER_PORT);
+    double reopened = 0;
     for (int turn = 1;; turn++) {
         if (!st.ip[0] && turn % 120 == 0) net_ip(st.ip);
         if (c.fd < 0) {
             int fd = sceNetAccept(ls, NULL, NULL);
+            if (fd < 0 && fd != NET_EAGAIN && now_s() - reopened > 2) {   // (the socket died: rest mode)
+                say("server: accept failed (0x%08X), listening again", (unsigned)fd);
+                sceNetSocketClose(ls);
+                ls = net_listen(SERVER_PORT, cfg->eng->error, sizeof(cfg->eng->error));
+                reopened = now_s();
+                if (ls < 0) say("%s", cfg->eng->error);
+            }
             if (fd >= 0) {
                 net_nbio(fd);
                 c.fd = fd, c.len = c.head = c.body = 0, c.last = now_s();
@@ -815,7 +868,7 @@ int server_run(ServerConfig* cfg) {
     sceNetSocketClose(ls);
     free(c.buf);
     free(cache);
-    cache = NULL, cached = 0;
+    cache = NULL, cached = snap_n = 0;
     say("server: stopped after %d requests", st.served);
     return 0;
 }

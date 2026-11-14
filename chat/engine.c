@@ -45,6 +45,7 @@
 #define PF_ROWS 32              // prompt tokens per batch (shaders/prefill.h; at most STEPS_PER_SUBMIT staging rows)
 #define ALIGN_2MB (2ull << 20)
 #define ATT_BLOCK 64            // ATT_BLOCK in shaders/attn.h (MAX_SEQ comes from model.idx)
+#define TQ_NB_MAX 8             // TQ_NB in shaders/attn_tq.h: TurboQuant cache blocks of 8192 positions at most
 #define ROW_CACHE 4096          // embedding rows kept in memory (power of two)
 #define SWAR_SPLIT_ROWS 12416   // split-K (partial sums) only for matrices up to this many rows
 
@@ -113,7 +114,58 @@ static uint64_t gpu_alloc(Engine* e, uint64_t size) {
     return (uint64_t)(uintptr_t)(e->mem + off);
 }
 
+uint64_t engine_alloc(Engine* e, uint64_t size) { return gpu_alloc(e, size); }
+
 int eng_margin_mb = 64;
+
+// RoPE table: [max_seq][rope_dim] = cos of the first half, then sin (RoPE on the first rope_dim dims of a head)
+static void rope_table(Engine* e) {
+    uint32_t half = e->rope_dim / 2;
+    e->rope = gpu_alloc(e, (uint64_t)e->max_seq * e->rope_dim * 4);
+    float* rope = (float*)(uintptr_t)e->rope;
+    for (uint32_t p = 0; rope && p < e->max_seq; p++)
+        for (uint32_t i = 0; i < half; i++) {
+            double ang = p * pow((double)e->rope_theta, -2.0 * i / e->rope_dim);
+            rope[(uint64_t)p * e->rope_dim + i] = (float)cos(ang);
+            rope[(uint64_t)p * e->rope_dim + half + i] = (float)sin(ang);
+        }
+}
+
+int engine_ctx(Engine* e, uint64_t per_block, uint64_t reserve) {
+    if (!(e->qwen35 && e->tq) || e->max_seq) return 0;
+    // TurboQuant (shaders/attn_tq.h), per full layer and block of 8192 positions: k = 4-bit words
+    // [n_kv][head_dim / 8][8192] + scales [n_kv][8192]; v = 4-bit codes [8192][n_kv][head_dim / 2 bytes] + scales
+    // [8192][n_kv]. Block b of all the layers (66 MiB for the 9B) at b * tq_split bytes; per block also the RoPE
+    // rows and the caller's per_block. The attention partials are laid out for TQ_NB_MAX blocks.
+    uint64_t kb = (uint64_t)e->n_kv * 8192 * (e->head_dim / 2 + 4), n_full = 0;
+    for (uint32_t i = 0; i < e->n_layers; i++) n_full += e->full_mask >> i & 1;
+    uint64_t part = (uint64_t)e->n_heads * (TQ_NB_MAX * 8192 / ATT_BLOCK) * (e->head_dim + 2) * 4;
+    uint64_t per = n_full * 2 * kb + 8192ull * e->rope_dim * 4 + per_block, slack = 16ull << 20;
+    uint64_t used = ((e->next + 255) & ~255ull) + part + reserve + slack;
+    uint64_t nb = used < e->mem_size ? (e->mem_size - used) / per : 0;
+    if (nb > TQ_NB_MAX) nb = TQ_NB_MAX;
+    if (!nb) {
+        fail(e, "no memory left for the context (%u MiB free)", (unsigned)((e->mem_size - e->next) >> 20));
+        return -1;
+    }
+    e->max_seq = (uint32_t)nb * 8192;
+    e->attn_part = gpu_alloc(e, part);
+    rope_table(e);
+    e->tq_split = n_full * 2 * kb;
+    uint64_t all = gpu_alloc(e, nb * e->tq_split);
+    if (!e->attn_part || !e->rope || !all) {
+        fail(e, "context of %u positions does not fit", e->max_seq);
+        return -1;
+    }
+    for (uint32_t i = 0, j = 0; i < e->n_layers; i++)
+        if (e->full_mask >> i & 1) {
+            e->kc[i] = all + j * 2 * kb;
+            e->vc[i] = e->kc[i] + kb;
+            j++;
+        }
+    e->ctx_limit = e->max_seq;
+    return 0;
+}
 
 static int reserve_garlic(Engine* e) {
     // as much of the app's direct memory as is still free (the framebuffers took theirs), 32 MiB at a time
@@ -231,11 +283,11 @@ static int load_kernels(Engine* e, const char* dir) {
         e->tq = e->k_qk_tq && e->k_attn_tq && e->k_comb_tq && !(off && fs && off[0] == '0');
         free(off);
         // a kernels.bin built with the batched prompt (mm_q4i_rows) has the attn_tq.h that takes the split
-        // argument: the cache can hold 16K (positions 8192.. in kv_hi)
+        // argument: the cache in blocks of 8192 positions (engine_ctx)
         for (int i = 0; i < e->nk; i++)
             if (!strcmp(e->k[i].name, "mm_q4i_rows")) e->tq16 = 1;
     }
-    // the prompt in batches (shaders/prefill.h); the same kernels.bin has the TurboQuant kernels for 16K (split).
+    // the prompt in batches (shaders/prefill.h); the same kernels.bin has the TurboQuant kernels with the split.
     // The embedding rows come from the disk (cpu_embed, the 9B) or from the GPU (4B).
     static const char* pf_names[7] = {"mm_q4i_rows", "mm_q3i_rows", "rmsnorm_rows", "silu_mul_rows",
                                       "mul_sigmoid_rows", "conv_silu_rows", "delta_rows"};
@@ -247,7 +299,7 @@ static int load_kernels(Engine* e, const char* dir) {
             if (!strcmp(e->k[i].name, pf_names[j])) *pf_k[j] = &e->k[i];
         if (!*pf_k[j]) e->pf = 0;
     }
-    {   // /data/garlic_pf.txt = 0: the prompt token by token again, without rebuilding (the 16K context stays)
+    {   // /data/garlic_pf.txt = 0: the prompt token by token again, without rebuilding (the context stays)
         size_t fs;
         char* sw = (char*)read_file("/data/garlic_pf.txt", &fs);
         if (sw && fs && sw[0] == '0') e->pf = 0;
@@ -354,20 +406,11 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     memcpy(e->init_state, init, sizeof(e->init_state));
     if (gpu_selftest(e)) return -1;   // before reading gigabytes of weights: does this console's GPU do the right thing?
 
-    if (e->tq && (e->head_dim != 256 || e->max_seq != 8192)) e->tq = 0;   // the kernels' shape (qwen35.cl MAX_SEQ)
-    // TurboQuant with a kernels.bin whose attn_tq.h takes the split argument: 16K of context, positions 8192.. in
-    // kv_hi (while it is not lent to S3Gen)
-    if (e->tq && e->tq16) e->max_seq = 2 * 8192;
-    // RoPE table: [max_seq][rope_dim] = cos of the first half, then sin (RoPE on the first rope_dim dims of a head)
-    uint32_t half = e->rope_dim / 2;
-    e->rope = gpu_alloc(e, (uint64_t)e->max_seq * e->rope_dim * 4);
-    float* rope = (float*)(uintptr_t)e->rope;
-    for (uint32_t p = 0; p < e->max_seq; p++)
-        for (uint32_t i = 0; i < half; i++) {
-            double ang = p * pow((double)e->rope_theta, -2.0 * i / e->rope_dim);
-            rope[(uint64_t)p * e->rope_dim + i] = (float)cos(ang);
-            rope[(uint64_t)p * e->rope_dim + half + i] = (float)sin(ang);
-        }
+    // the kernels' shape (qwen35.cl MAX_SEQ); TurboQuant needs a kernels.bin whose attn_tq.h takes the split argument
+    if (e->tq && (e->head_dim != 256 || e->max_seq != 8192 || !e->tq16)) e->tq = 0;
+    // With TurboQuant the cache, the RoPE table and the attention partials come last (engine_ctx), sized by the
+    // memory that is left
+    if (!(e->qwen35 && e->tq)) rope_table(e);
 
     if (e->head_dim != (e->qwen35 ? 256u : 128u) || e->n_heads / e->n_kv > 4 || e->max_seq % ATT_BLOCK) {
         fail(e, "model shape not supported by the kernels (max_seq %u, head_dim %u)", e->max_seq, e->head_dim);
@@ -381,47 +424,17 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     e->kc = calloc(e->n_layers, sizeof(uint64_t));
     e->vc = calloc(e->n_layers, sizeof(uint64_t));
     e->ctx_limit = e->max_seq;
-    e->lend_ctx = e->max_seq / 2;
     if (e->qwen35 && e->tq) {
-        // TurboQuant (shaders/attn_tq.h), per full layer and block of 8192 positions: k = 4-bit words
-        // [n_kv][head_dim / 8][8192] + scales [n_kv][8192]; v = 4-bit codes [8192][n_kv][head_dim / 2 bytes] +
-        // scales [8192][n_kv]. Positions 0..8191 of all the layers in one block (66 MiB). kv_hi is a block of its own,
-        // the size of the second halves without TurboQuant (S3Gen's weights in voice mode). With 16K (max_seq 16384)
-        // positions 8192.. of each layer are in kv_hi at the same offset (tq_split bytes from the first block):
-        // lending it shortens the context to 8192 (lend_ctx); with 8K, lending it leaves the context whole.
+        // TurboQuant (shaders/attn_tq.h): the full layers' caches come in engine_ctx; here the DeltaNet states
         static const uint32_t tab[40] = {TQ_TABLE};
-        uint64_t kb = (uint64_t)e->n_kv * 8192 * (e->head_dim / 2 + 4), n_full = 0;
-        for (uint32_t i = 0; i < e->n_layers; i++) n_full += e->full_mask >> i & 1;
-        uint64_t all = gpu_alloc(e, n_full * 2 * kb);
-        e->kv_split = n_full * (4096ull * e->n_kv * e->head_dim * 2 + 4096ull * e->n_kv * (e->head_dim + 4));
-        e->kv_hi = e->kv_split ? gpu_alloc(e, e->kv_split) : 0;
-        e->lend_ctx = e->max_seq;
-        if (e->max_seq > 8192) {
-            if (all && e->kv_hi && e->kv_split >= n_full * 2 * kb) {
-                e->tq_split = e->kv_hi - all;
-                e->lend_ctx = 8192;
-            } else {
-                e->max_seq = 8192;   // (cannot happen: the block is 96.5 MiB, the second 8K takes 66)
-            }
-        }
-        e->ctx_limit = e->max_seq;
         e->tq_tab = gpu_alloc(e, 256);
         if (e->tq_tab) memcpy((void*)(uintptr_t)e->tq_tab, tab, sizeof(tab));
-        for (uint32_t i = 0, j = 0; all && e->tq_tab && i < e->n_layers; i++) {
-            if (e->full_mask >> i & 1) {
-                e->kc[i] = all + j * 2 * kb;
-                e->vc[i] = e->kc[i] + kb;
-                j++;
-            } else {
+        for (uint32_t i = 0; e->tq_tab && i < e->n_layers; i++)
+            if (!(e->full_mask >> i & 1)) {
                 e->kc[i] = gpu_alloc(e, e->conv_n * 12);
                 e->vc[i] = gpu_alloc(e, e->state_bytes);
             }
-        }
-        char line[160];
-        snprintf(line, sizeof(line), "[ps4ai] TurboQuant KV cache: %u MiB for 8192 positions (+%u MiB lendable; "
-                 "context %u, %u while lent)\n", (unsigned)(n_full * 2 * kb >> 20), (unsigned)(e->kv_split >> 20),
-                 e->max_seq, e->lend_ctx);
-        sceKernelDebugOutText(0, line);
+        e->ctx_limit = e->max_seq = 0;   // (until engine_ctx)
     } else if (e->qwen35) {
         // values in int8 + a float scale per (position, kv head) (V_INT8 in shaders/qwen35.cl); each full layer's
         // k and v in two halves of max_seq / 2 positions (ATTN_SPLIT): the first halves of all the layers in one
@@ -450,7 +463,7 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
         }
     }
     for (uint32_t i = 0; i < e->n_layers; i++)
-        if (!e->kc[i] || !e->vc[i]) {
+        if ((!e->kc[i] || !e->vc[i]) && !(e->tq && e->qwen35 && e->full_mask >> i & 1)) {
             fail(e, "caches do not fit in %u MiB", (unsigned)(e->mem_size >> 20));
             return -1;
         }
@@ -458,10 +471,8 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     e->xn = gpu_alloc(e, e->hidden * 4);
     e->attn = gpu_alloc(e, (uint64_t)(e->n_heads * e->head_dim > e->n_vh * e->dv ? e->n_heads * e->head_dim
                                                                                   : e->n_vh * e->dv) * 4);
-    // (the TurboQuant kernels of a kernels.bin with the batched prompt always lay it out for 16K, 256 blocks)
-    uint32_t part_seq = e->max_seq;
-    if (e->tq16 && part_seq < 16384) part_seq = 16384;
-    e->attn_part = gpu_alloc(e, (uint64_t)e->n_heads * (part_seq / ATT_BLOCK) * (e->head_dim + 2) * 4);
+    if (!(e->qwen35 && e->tq))
+        e->attn_part = gpu_alloc(e, (uint64_t)e->n_heads * (e->max_seq / ATT_BLOCK) * (e->head_dim + 2) * 4);
     e->hmlp = gpu_alloc(e, e->inter * 4);
     e->bsum = gpu_alloc(e, (uint64_t)(e->inter > e->hidden ? e->inter : e->hidden) / 32 * 4 + 4096);
     uint32_t stage_rows = STEPS_PER_SUBMIT;
@@ -593,14 +604,6 @@ static int fetch_row(Engine* e, uint32_t tok, float* dst) {
     return 0;
 }
 
-uint64_t engine_kv_lend(Engine* e, uint64_t* size) {
-    if (!e->kv_hi) return *size = 0, 0;
-    e->ctx_limit = e->lend_ctx;
-    *size = e->kv_split;
-    return e->kv_hi;
-}
-
-void engine_kv_return(Engine* e) { e->ctx_limit = e->max_seq; }
 
 void engine_reset(Engine* e) {
     for (uint32_t i = 0; i < e->n_layers; i++)
@@ -820,7 +823,7 @@ static void step(Engine* e, uint32_t pos, uint32_t forced, uint32_t slot, int sa
         uint32_t blocks = pos / ATT_BLOCK + 1;
         double sc = 1.0 / sqrt((double)e->head_dim);
         if (e->tq) {   // TurboQuant cache: q rotated, k and v in 4 bits; the merge (always) rotates the output back
-            // (tq_split: where positions 8192.. are; an older kernels.bin ignores the last argument)
+            // (tq_split: the distance between cache blocks of 8192 positions)
             dispatch(e, e->k_qk_tq,
                      args(e, "pppppppuuufp", e->qkv, W(e, b + 2), W(e, b + 3), e->rope, kc, vc, e->tq_tab, pos,
                           e->n_heads, e->n_kv, (double)e->eps, e->tq_split),
@@ -1017,16 +1020,17 @@ static int submit_go(Engine* e) {
 
 static int submit_wait(Engine* e) {
     uint64_t t0 = e->submit_tsc;
-    // Spin for the first 20 ms (T3 and the voice need the answer at once), then sleep between checks. Reading the
-    // results as soon as the label flips relies on the L2 write-back before it (EOP_WB_INV_L1_L2): without it the
-    // GPU's last writes could still sit in its L2.
+    // Spin for the first second (a decode pass takes ~25 ms; a sleep there would wake up late), then sleep between
+    // checks. Reading the results as soon as the label flips relies on the L2 write-back before it (EOP_WB_INV_L1_L2):
+    // without it the GPU's last writes could still sit in its L2.
     while (*e->label != LABEL_DONE) {
         uint64_t dt = sceKernelReadTsc() - t0;
         if (dt > e->tsc_freq * 10) {
             fail(e, "GPU did not finish within 10 s");
             return -1;
         }
-        if (dt > e->tsc_freq / 50) sceKernelUsleep(200);
+        if (dt > e->tsc_freq) sceKernelUsleep(200);
+        else if (e->wait_us) sceKernelUsleep(e->wait_us);
         else __asm__ volatile("pause" ::: "memory");
     }
     __asm__ volatile("mfence" ::: "memory");

@@ -101,15 +101,30 @@ static int video_init(void) {
 }
 
 static void present(void) {
+    static int stuck;
+    static double tried;
+    if (stuck && now() - tried < 5) return;   // (no screen: try again every 5 s, not at every frame)
+    tried = now();
     memcpy(fb[cur], back, SCREEN_W * SCREEN_H * 4);
     sceVideoOutSubmitFlip(video, cur, ORBIS_VIDEO_OUT_FLIP_VSYNC, frame);
-    for (;;) {
+    // (at most half a second: after rest mode, or with the TV off, the flip may never come, and the server would stop)
+    for (int i = 0;; i++) {
         OrbisVideoOutFlipStatus st;
         sceVideoOutGetFlipStatus(video, &st);
-        if (st.flipArg >= frame) break;
+        if (st.flipArg >= frame) {
+            if (stuck) say("screen: flips again");
+            stuck = 0;
+            break;
+        }
+        if (i == 5) {
+            if (!stuck) say("screen: no flip for 0.5 s");
+            stuck = 1;
+            break;
+        }
         OrbisKernelEvent ev;
         int count;
-        if (sceKernelWaitEqueue(flip_queue, &ev, 1, &count, 0)) break;
+        OrbisKernelUseconds wait = 100000;
+        sceKernelWaitEqueue(flip_queue, &ev, 1, &count, &wait);
     }
     cur ^= 1;
     frame++;
@@ -156,15 +171,20 @@ static Tokenizer tok;
 static int encode_into(uint32_t* ids, int n, int max, const char* text) { return n + tok_encode(&tok, text, ids + n, max - n); }
 
 static int server_frame(void* user, const ServerStatus* st) {
-    static double last;
-    static int was_busy;
+    static int shown = -1;
+    static char ip[16];
     (void)user;
-    // While answering, a few frames a second: present waits for the TV's refresh, up to 16 ms per token
-    double t = now();
-    if (st->busy && was_busy && t - last < 0.25) return 0;
-    last = t, was_busy = st->busy;
-    draw_server(st->ip, st->port, st->busy, st->busy ? st->served + 1 : st->served);
-    present();
+    // A frame only when what it shows changes (while answering, present would wait for the TV's refresh, up to 16 ms
+    // per token); idle, the server checks for a connection 50 times a second and sleeps in between
+    int now_shown = st->busy ? -2 - st->served : st->served;
+    if (now_shown != shown || strcmp(ip, st->ip)) {
+        shown = now_shown;
+        memcpy(ip, st->ip, sizeof(ip));
+        draw_server(st->ip, st->port, st->busy, st->busy ? st->served + 1 : st->served);
+        present();
+    } else if (!st->busy) {
+        sceKernelUsleep(20000);
+    }
     return 0;   // the server runs until the app is closed
 }
 
@@ -192,14 +212,22 @@ int main(void) {
     say("tokenizer: %u tokens", tok.n_vocab);
     eng_margin_mb = 64 - ui_screen_pool_mb();   // (the screen block came out of the system's 64 MiB)
     if (engine_init(&eng, ASSETS, loading, (void*)tr(S_LOADING_MODEL))) show_error(eng.error);
+    uint64_t per_block = 0, reserve = 0;
+#ifdef GARLIC_SPEC
+    int spec = !spec_init(&eng, ASSETS);
+    if (spec) reserve = spec_need(&eng, &per_block);
+#endif
+    // the state snapshot of the server (+ the MTP head's carry, which engine_state_size counts once the head is in)
+    uint64_t snap = engine_alloc(&eng, engine_state_size(&eng) + eng.hidden * 4);
+    if (engine_ctx(&eng, per_block, reserve)) show_error(eng.error);
     say("language model ready; GPU memory used %u of %u MiB; context cache %s, %u tokens",
         (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20), eng.tq ? "TurboQuant 4-bit" : "fp16 k + int8 v",
         eng.ctx_limit);
 #ifdef GARLIC_SPEC
-    if (spec_init(&eng, ASSETS) || spec_start(&eng)) say("spec: no MTP head (mtp.idx, the q4s model or memory missing)");
+    if (!spec || spec_start(&eng)) say("spec: no MTP head (mtp.idx, the q4s model or memory missing)");
 #endif
     say("GPU memory used: %u of %u MiB", (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20));
-    ServerConfig cfg = {&eng, &tok, eng.im_start, eng.im_end, THINK, THINK_END, MAX_REPLY, encode_into, server_frame, NULL};
+    ServerConfig cfg = {&eng, &tok, eng.im_start, eng.im_end, THINK, THINK_END, MAX_REPLY, encode_into, server_frame, NULL, snap};
     if (server_run(&cfg)) show_error(eng.error);
     for (;;) sceKernelUsleep(1000000);
 }

@@ -25,6 +25,8 @@ typedef struct {
     int (*encode)(uint32_t* ids, int n, int max, const char* text);  // appends text's tokens, returns the new count
     int (*frame)(void* user, const ServerStatus* st);                // returns 1 to leave server mode
     void* user;
+    uint64_t snap;                      // GPU memory for engine_state_copy, 0 = none: the state at the end of the
+                                        // last prompt, for a next prompt that only shares that much with the cache
 } ServerConfig;
 
 // Listens on 0.0.0.0:SERVER_PORT until frame asks to leave (0), or -1 when it cannot listen (cfg->eng->error).

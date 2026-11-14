@@ -130,7 +130,7 @@ int spec_init(Engine* e, const char* dir) {
     return 0;
 }
 
-// Memory the head needs in the lent block: weights + draft table + cache (16K, TurboQuant) + buffers.
+// Memory the head needs: weights + draft table + cache (TurboQuant, max_seq positions) + buffers.
 static uint64_t spec_layout(Engine* e, uint64_t base) {
     Spec* s = &g_spec;
     uint64_t p = base;
@@ -138,7 +138,7 @@ static uint64_t spec_layout(Engine* e, uint64_t base) {
     TAKE(model, s->wsize);
     TAKE(table, s->tsize);
     uint64_t kb = (uint64_t)e->n_kv * 8192 * (e->head_dim / 2 + 4);
-    TAKE(kc, 4 * kb);
+    TAKE(kc, 2 * kb * (e->max_seq / 8192));   // (as many blocks as the 9B's cache)
     s->vc = s->kc + kb;
     s->tq_split = 2 * kb;
     uint64_t H = e->hidden, R = SPEC_ROWS;
@@ -216,8 +216,15 @@ int spec_load(Engine* e, uint64_t base, uint64_t size, int start) {
 }
 
 // The head into GPU memory of its own, at start-up (nothing else borrows it in the server app).
+uint64_t spec_need(Engine* e, uint64_t* per_block) {
+    *per_block = 0;
+    if (!g_spec.idx_ok || !e->tq || e->max_seq) return 0;
+    *per_block = 2ull * e->n_kv * 8192 * (e->head_dim / 2 + 4);
+    return spec_layout(e, 0) + 512;
+}
+
 int spec_start(Engine* e) {
-    if (!g_spec.idx_ok) return -1;
+    if (!g_spec.idx_ok || !e->tq || !e->max_seq) return -1;
     uint64_t need = spec_layout(e, 0) + 256;
     uint64_t base = gpu_alloc(e, need);
     if (!base) {
@@ -352,9 +359,10 @@ static void spec_prefill(Engine* e, uint64_t stage, uint32_t n, uint32_t pos0) {
 static volatile uint32_t* ST(void) { return (volatile uint32_t*)(uintptr_t)g_spec.st; }
 
 // Submission D: the head over the pairs (Hc rows 0..c-1 with the tokens of rows `rows` / the CPU's staging row for
-// the last one when it is not a draft row), then the chain. i0 = index of the first pair.
+// the last one when it is not a draft row), then the chain. i0 = index of the first pair. shift: first move Hc rows
+// 1..c to rows 0..c-1 (the h's the verify pass left there), in the same submission.
 static int spec_draft(Engine* e, const uint32_t* rows, uint32_t c, uint32_t i0, int stage_last, float inv_temp,
-                      uint32_t seed, int kmax) {
+                      uint32_t seed, int kmax, int shift) {
     Spec* s = &g_spec;
     uint64_t H = e->hidden;
     double min_gap = inv_temp > 0.0f ? 2.9957 / inv_temp : 0.0;
@@ -362,6 +370,10 @@ static int spec_draft(Engine* e, const uint32_t* rows, uint32_t c, uint32_t i0, 
     st[ST_STOP] = 0, st[ST_K] = 0;
     __asm__ volatile("sfence" ::: "memory");
     begin(e);
+    if (shift) {
+        dispatch(e, e->k_copy, args(e, "ppu", s->Hc + H * 4, s->X, (uint32_t)(c * H)), (uint32_t)(c * H / 256), 256);
+        dispatch(e, e->k_copy, args(e, "ppu", s->X, s->Hc, (uint32_t)(c * H)), (uint32_t)(c * H / 256), 256);
+    }
     for (uint32_t r = 0; r < c; r++) {
         if (r == c - 1 && stage_last)
             dispatch(e, e->k_copy, args(e, "ppu", e->staging, s->E + (uint64_t)r * H * 4, (uint32_t)H), (uint32_t)(H / 256),
@@ -507,7 +519,7 @@ int engine_spec_step(Engine* e, uint32_t tok, int pos, float temperature, uint32
         int stage_last = r < 0 || (uint32_t)r >= s->nd;
         if (stage_last && fetch_row(e, tok, (float*)(uintptr_t)e->staging)) return -1;
         uint32_t rr = (uint32_t)(r < 0 ? 0 : r);
-        if (spec_draft(e, &rr, 1, hp - 1, stage_last, inv_temp, seed * 2654435761u + 17, s->kmax)) return -1;
+        if (spec_draft(e, &rr, 1, hp - 1, stage_last, inv_temp, seed * 2654435761u + 17, s->kmax, 0)) return -1;
     }
     volatile uint32_t* st = ST();
     uint32_t K = st[ST_STOP] && st[ST_K] == 0 ? 0 : st[ST_K];
@@ -547,12 +559,8 @@ int engine_spec_step(Engine* e, uint32_t tok, int pos, float temperature, uint32
         rows[j] = nx;
         int stage_last = nx >= s->nd;
         if (stage_last && fetch_row(e, *next, (float*)(uintptr_t)e->staging)) return -1;
-        // Hc rows 1..j+1 are the h's of positions pos..pos+j: shift them to rows 0..j for spec_draft
-        begin(e);
-        dispatch(e, e->k_copy, args(e, "ppu", s->Hc + (uint64_t)H * 4, s->X, (j + 1) * H), (j + 1) * H / 256, 256);
-        dispatch(e, e->k_copy, args(e, "ppu", s->X, s->Hc, (j + 1) * H), (j + 1) * H / 256, 256);
-        if (submit(e)) return -1;
-        if (spec_draft(e, rows, j + 1, hp, stage_last, inv_temp, seed * 2654435761u + 17, s->kmax)) return -1;
+        // Hc rows 1..j+1 are the h's of positions pos..pos+j: spec_draft shifts them to rows 0..j first
+        if (spec_draft(e, rows, j + 1, hp, stage_last, inv_temp, seed * 2654435761u + 17, s->kmax, 1)) return -1;
     }
     s->wall += (double)sceKernelReadTsc() / e->tsc_freq - t0;
     e->last_gpu_seconds = 0;

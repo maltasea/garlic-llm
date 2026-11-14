@@ -62,19 +62,17 @@ typedef struct {
     uint64_t *kc, *vc;            // per layer: KV cache (full attention) or conv state / delta-rule state (DeltaNet)
     uint64_t conv_n, state_bytes;
     // Qwen3.5: each full layer's cache is two halves (ATTN_SPLIT in shaders/attn.h); the second halves of all the
-    // layers form one block [kv_hi, kv_hi + kv_split) that may be lent out while the context stays under max_seq / 2
+    // layers form one block [kv_hi, kv_hi + kv_split)
     uint64_t kv_hi, kv_split;
-    uint32_t ctx_limit;           // positions the conversation may use: max_seq, or max_seq / 2 while kv_hi is lent
-    uint32_t lend_ctx;            // ctx_limit while kv_hi is lent (max_seq with the TurboQuant cache)
-    // TurboQuant 4-bit KV cache (shaders/attn_tq.h). The whole context fits in a third of the memory, so kv_hi is a
-    // block of its own: lending it does not shorten an 8K context.
+    uint32_t ctx_limit;           // positions the conversation may use (max_seq)
+    int wait_us;                  // waiting for the GPU: sleep this long between checks (0 = spin)
+    // TurboQuant 4-bit KV cache (shaders/attn_tq.h), allocated by engine_ctx
     int tq;
     uint64_t tq_tab;              // 40 words for the kernels: levels, boundaries, sign bits (pc/turboquant.py)
     const GpuKernel *k_qk_tq, *k_attn_tq, *k_comb_tq;
-    // With TurboQuant the context is 16K: positions 0..8191 in the cache block, 8192..16383 at tq_split bytes
-    // further, inside kv_hi (so while kv_hi is lent the context is 8K, lend_ctx)
+    // With TurboQuant, positions 8192 b .. 8192 b + 8191 are in cache block b, b * tq_split bytes further
     uint64_t tq_split;
-    int tq16;                     // kernels.bin's TurboQuant kernels take tq_split (16K of context)
+    int tq16;                     // kernels.bin's TurboQuant kernels take tq_split (blocks of 8192 positions)
     // The prompt in batches of up to PF_ROWS tokens (shaders/prefill.h): row buffers for the residual (pf_x),
     // its norm (pf_xn), the projections (pf_a: DeltaNet input, q|k|v|gate or gate|up) and their products (pf_h:
     // attention or delta-rule output, SiLU(gate) * up)
@@ -128,15 +126,18 @@ void engine_reset(Engine* e);
 // (save 0), so that the conversation can go back to the position where they were saved. 0 = done.
 uint64_t engine_state_size(const Engine* e);
 int engine_state_copy(Engine* e, uint64_t buf, int save);
-// Lend the second half of the language model's context (kv_hi, kv_split bytes): from then on ctx_limit is
-// lend_ctx (max_seq / 2; with the TurboQuant cache and 8K of context, kv_hi is spare memory and the context stays
-// max_seq), so positions past it must not be in use. engine_kv_return gives it back (contents are not kept).
-uint64_t engine_kv_lend(Engine* e, uint64_t* size);
-void engine_kv_return(Engine* e);
+// With the TurboQuant cache: the cache, after everything else (call it once, after engine_init, before the first
+// run). As many blocks of 8192 positions as fit (up to 64K), leaving `reserve` bytes free and counting per_block
+// more bytes for each block (the MTP head's cache). Sets max_seq and ctx_limit. 0 = done (or nothing to do).
+int engine_ctx(Engine* e, uint64_t per_block, uint64_t reserve);
+// GPU memory of the engine's block (before engine_ctx, which takes what is left); 0 = no room.
+uint64_t engine_alloc(Engine* e, uint64_t size);
 // Speculative decoding with Qwen3.5's MTP head (GARLIC_SPEC; engine_spec.inc). spec_init reads mtp.idx from the
 // engine's assets; spec_start gives the head, its draft rows and its cache GPU memory of their own and loads them
 // (spec_load: into [base, base + size); start = the conversation position it follows from, 0 = empty).
+// spec_need: what spec_start will take, before engine_ctx (*per_block more for each cache block of 8192 positions).
 int spec_init(Engine* e, const char* dir);
+uint64_t spec_need(Engine* e, uint64_t* per_block);
 int spec_start(Engine* e);
 int spec_load(Engine* e, uint64_t base, uint64_t size, int start);
 void spec_unload(Engine* e);

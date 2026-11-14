@@ -15,16 +15,17 @@
 //      positions consecutive (as the fp16 cache, lane = position); then the scales [n_kv][TQ_SEQ] float
 //   v  [TQ_SEQ][n_kv][128] bytes: byte b = dims 2b (low nibble) and 2b + 1; then the scales [TQ_SEQ][n_kv] float
 // 8.25 MiB per layer and block of 8192 positions with 4 kv heads (fp16 k + int8 v: 24.1 MiB).
-// Positions TQ_SEQ .. 2 TQ_SEQ - 1 (16K of context) are in a second block with the same layout, `split` bytes
-// after the first (the engine keeps them in its lendable block, kv_hi).
+// Positions b TQ_SEQ .. (b + 1) TQ_SEQ - 1 are in block b, with the same layout, b `split` bytes after the first; up
+// to TQ_NB blocks (64K of context; the engine takes as many as its memory holds).
 
 #define TQ_D 256
 #define TQ_WORDS (TQ_D / 8)
 #define TQ_SEQ MAX_SEQ                           // positions per block
-#define TQ_MAX_BLOCKS (2 * TQ_SEQ / ATT_BLOCK)   // attention blocks of up to 16K positions (layout of `part`)
+#define TQ_NB 8                                  // cache blocks at most (TQ_NB_MAX in chat/engine.c)
+#define TQ_MAX_BLOCKS (TQ_NB * TQ_SEQ / ATT_BLOCK) // attention blocks of up to 64K positions (layout of `part`)
 #define TQ_KSC(kc, n_kv) ((global float*)((global uint*)(kc) + (ulong)(n_kv) * TQ_WORDS * TQ_SEQ))
 #define TQ_VSC(vc, n_kv) ((global float*)((global uchar*)(vc) + (ulong)TQ_SEQ * (n_kv) * (TQ_D / 2)))
-#define TQ_AT(c, p) ((p) >= TQ_SEQ ? (global void*)((global uchar*)(c) + split) : (global void*)(c))
+#define TQ_AT(c, p) ((global void*)((global uchar*)(c) + (ulong)((p) / TQ_SEQ) * split))
 
 // x[m] = element j + 64 m of a 256-vector held by 64 threads (one wave). Multiplies it by the signs, then applies
 // the unnormalised Walsh-Hadamard transform (natural order): strides 64 and 128 inside each thread, 1 .. 32
