@@ -32,4 +32,4 @@ int ui_screen_pool_mb(void);
 void draw_loading(float frac, const char* what);
 void draw_error(const char* what);
 // the server screen: the base URL and the status (busy 1 while request number served is answered)
-void draw_server(const char* ip, int port, int busy, int served);
+void draw_server(const char* ip, int port, int busy, int served, const char* models);   // models: a line, or NULL

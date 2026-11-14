@@ -50,6 +50,11 @@ int tok_load(Tokenizer* t, const uint8_t* data, size_t size) {
     return (size_t)(p - data) == size ? 0 : -2;
 }
 
+void tok_free(Tokenizer* t) {
+    free(t->raw), free(t->raw_len), free(t->special), free(t->keys), free(t->rank), free(t->merged);
+    memset(t, 0, sizeof(*t));
+}
+
 static int find_merge(const Tokenizer* t, uint32_t a, uint32_t b, uint32_t* merged) {
     uint64_t key = ((uint64_t)a << 32 | b) + 1;
     uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 40) & t->mask;

@@ -65,3 +65,32 @@ def quantize_q4_mse(w, factors=(1.0, 0.95, 0.9, 0.85, 0.8)):
     q = best_q.astype(np.uint8)
     packed = q[..., :16] | (q[..., 16:] << 4)
     return packed.reshape(rows, cols // 2), best_d
+
+
+def to_q4s(q, d):
+    """q [rows, cols] nibbles 0..15, d [rows, nb] fp16 -> (q4s words bytes, scale bytes); rows % 128 == 0."""
+    rows, cols = q.shape
+    T, nb = rows // 128, cols // 32
+    q = q.astype(np.uint32).reshape(T, 2, 64, nb, 8, 4)          # tile, A/B, lane, block, word k, nibble i
+    half = q[..., 0] | (q[..., 1] << 4) | (q[..., 2] << 8) | (q[..., 3] << 12)
+    words = half[:, 0] | (half[:, 1] << 16)                       # T, lane, block, word
+    words = words.reshape(T, 64, nb, 2, 4).transpose(0, 2, 3, 1, 4)    # T, block, h, lane, 4 words
+    d = d.astype(np.float16).view(np.uint16).astype(np.uint32).reshape(T, 2, 64, nb)
+    sc = (d[:, 0] | (d[:, 1] << 16)).transpose(0, 2, 1)          # T, block, lane
+    return np.ascontiguousarray(words).tobytes(), np.ascontiguousarray(sc).tobytes()
+
+
+def pad128(q, d):
+    rows = q.shape[0]
+    p = (-rows) % 128
+    if p:
+        q = np.concatenate([q, np.full((p, q.shape[1]), 8, np.uint8)])          # (q - 8) * d = 0
+        d = np.concatenate([d, np.full((p, d.shape[1]), 6.2e-5, np.float16)])
+    return q, d
+
+
+def q4_of(w):
+    packed, d16 = quantize_q4(w)
+    rows = w.shape[0]
+    p = packed.reshape(rows, -1, 16)
+    return np.concatenate([p & 15, p >> 4], axis=2).reshape(rows, -1), d16

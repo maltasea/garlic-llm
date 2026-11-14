@@ -74,14 +74,21 @@ static void fail(Engine* e, const char* fmt, ...) {
 
 // Where a weights file is: inside the package (/app0/models, the all-in-one PKG) or, with an app-only package, at the
 // path its index names (in /data). The first one that exists; path (129 bytes or more) is rewritten in place.
-static void weights_locate(char* path) {
+// A path from an idx file: a bare name is in the idx's folder (a model folder, /data/models/<id>); an absolute one is
+// taken from the package's models/ when it has the file (a full build), else as it is.
+static void weights_locate(char* path, const char* dir) {
     const char* base = strrchr(path, '/');
     char in_pkg[129];
-    snprintf(in_pkg, sizeof(in_pkg), "/app0/models/%s", base ? base + 1 : path);
-    int f = open(in_pkg, O_RDONLY);
-    if (f >= 0) {
-        close(f);
+    if (!base) {
+        snprintf(in_pkg, sizeof(in_pkg), "%s/%s", dir, path);
         strcpy(path, in_pkg);
+    } else {
+        snprintf(in_pkg, sizeof(in_pkg), "/app0/models/%s", base + 1);
+        int f = open(in_pkg, O_RDONLY);
+        if (f >= 0) {
+            close(f);
+            strcpy(path, in_pkg);
+        }
     }
     say("weights: %s", path);
 }
@@ -326,7 +333,7 @@ static int load_index(Engine* e, const char* dir) {
     memcpy(&e->rope_theta, d + 48, 4);
     memcpy(e->weights_path, d + 52, 128);
     e->weights_path[128] = 0;
-    weights_locate(e->weights_path);
+    weights_locate(e->weights_path, dir);
     memcpy(&e->weights_size, d + 180, 8);
     memcpy(&e->n_tensors, d + 188, 4);
     uint32_t rec0 = 192, vocab_map = 0;
@@ -380,14 +387,45 @@ static int load_index(Engine* e, const char* dir) {
     0x3e83c781u, 0x3f054a70u, 0x3f4bf7e8u, 0x3f8c2ae2u, 0x3fb722a6u, 0x3feaaee6u, 0x401886ceu, 0x00000000u, \
     0x76452f77u, 0x1d5aee0du, 0xda3d646du, 0x05d4b13du, 0x9642207cu, 0x5d203182u, 0x0d2a2a6du, 0xb4a5b633u
 
-int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
+int engine_init(Engine* e, const char* dir, const char* model_dir, ProgressFn progress, void* user) {
     memset(e, 0, sizeof(*e));
-    e->tsc_freq = sceKernelGetTscFrequency();
-    if (load_index(e, dir)) return -1;
     if (reserve_garlic(e)) {
         fail(e, "could not reserve GPU memory");
         return -1;
     }
+    return engine_load(e, dir, model_dir, progress, user);
+}
+
+int engine_init_at(Engine* e, uint64_t mem, uint64_t size, const char* dir, const char* model_dir, ProgressFn progress,
+                   void* user) {
+    e->mem = (uint8_t*)(uintptr_t)mem, e->mem_size = size;   // (engine_load frees what a model before it left)
+    return engine_load(e, dir, model_dir, progress, user);
+}
+
+uint64_t engine_need(const char* model_dir) {
+    Engine t;
+    memset(&t, 0, sizeof(t));
+    if (load_index(&t, model_dir)) return 0;
+    uint64_t n = (t.weights_size + 255) & ~255ull, n_full = 0;
+    for (uint32_t i = 0; i < t.n_layers; i++) n_full += t.full_mask >> i & 1;
+    if (!t.qwen35) n += n_full * 2ull * t.max_seq * t.n_kv * t.head_dim * 2;   // the fp16 KV cache (attn.h)
+    n += (uint64_t)t.max_seq * t.rope_dim * 4 + DCB_BYTES + KARGS_BYTES + (32ull << 20);   // RoPE, commands, the rest
+    free(t.layer_base), free(t.t);
+    return t.qwen35 ? 0 : n;   // (Qwen3.5 sizes its cache by the memory left: engine_ctx)
+}
+
+int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn progress, void* user) {
+#ifdef GARLIC_SPEC
+    spec_unload(e);   // (its memory is in the block that is laid out again)
+#endif
+    free(e->layer_base), free(e->t), free(e->kc), free(e->vc), free(e->ids), free(e->row_tag);
+    if (e->row_cache) close(e->fd), free(e->row_cache);
+    uint8_t* mem = e->mem;
+    uint64_t mem_size = e->mem_size;
+    memset(e, 0, sizeof(*e));   // (everything but the GPU block: kernels, buffers and caches are set up again in it)
+    e->mem = mem, e->mem_size = mem_size;
+    e->tsc_freq = sceKernelGetTscFrequency();
+    if (load_index(e, model_dir)) return -1;
     char line[200];
     snprintf(line, sizeof(line), "[ps4ai] %u MiB of GPU memory at %p; model %u layers, hidden %u, vocab %u\n",
              (unsigned)(e->mem_size >> 20), e->mem, e->n_layers, e->hidden, e->vocab);

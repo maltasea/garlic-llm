@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <orbis/Net.h>
@@ -14,11 +16,6 @@
 #include "server.h"
 #include "ui.h"
 
-#if defined(GARLIC_4B)
-#define MODEL_ID "qwen3.5-4b"
-#else
-#define MODEL_ID "qwen3.5-9b"
-#endif
 #define CREATED 1763000000      // "created" in every reply: fixed for the run
 #define HEAD_MAX 16384          // request line + headers
 #define IDLE_S 30.0             // a client silent this long is dropped (the next one is waiting)
@@ -175,10 +172,39 @@ static void reply_error(int fd, int code, const char* type, const char* message)
     say("server: %d %s", code, message);
 }
 
-static void models(int fd) {
+// A model the server can load: MODEL_ID, or a folder of MODELS_DIR with a model.idx (a plain name: no '/', no '.')
+static int model_exists(const char* id) {
+    if (!strcmp(id, MODEL_ID)) return 1;
+    if (!*id || strlen(id) > 48 || strchr(id, '/') || id[0] == '.') return 0;
+    char p[128];
+    snprintf(p, sizeof(p), MODELS_DIR "/%s/model.idx", id);
+    int f = open(p, O_RDONLY);
+    if (f >= 0) close(f);
+    return f >= 0;
+}
+
+static void model_entry(Buf* b, const char* id, int* first) {
+    buf_printf(b, "%s{\"id\":", *first ? "" : ",");
+    json_str(b, id, strlen(id));
+    buf_printf(b, ",\"object\":\"model\",\"created\":%d,\"owned_by\":\"garlic\"}", CREATED);
+    *first = 0;
+}
+
+// The loaded model first, then the others (the built-in one and the folders)
+static void models(ServerConfig* cfg, int fd) {
     Buf b = {0};
-    buf_printf(&b, "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"created\":%d,"
-                   "\"owned_by\":\"garlic\"}]}", MODEL_ID, CREATED);
+    int first = 1;
+    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    model_entry(&b, cfg->model, &first);
+    if (strcmp(cfg->model, MODEL_ID)) model_entry(&b, MODEL_ID, &first);
+    if (cfg->embed_model[0]) model_entry(&b, cfg->embed_model, &first);
+    DIR* d = opendir(MODELS_DIR);
+    for (struct dirent* x; d && (x = readdir(d));)
+        if (strcmp(x->d_name, cfg->model) && strcmp(x->d_name, MODEL_ID) && strcmp(x->d_name, cfg->embed_model) &&
+            model_exists(x->d_name))
+            model_entry(&b, x->d_name, &first);
+    if (d) closedir(d);
+    buf_puts(&b, "]}");
     reply_json(fd, 200, &b);
     free(b.p);
 }
@@ -347,6 +373,7 @@ typedef struct {
     double temperature;
     long max_tokens, max_completion;   // -1 = absent
     int stream, seed, has_seed;
+    Buf model;                         // "model", empty = the loaded one
 } Request;
 
 typedef struct {
@@ -414,6 +441,7 @@ static int request_field(Json* j, const char* key, void* user) {
     double v;
     if (j_peek(j) == 'n') return j_lit(j, "null");   // null = absent
     if (!strcmp(key, "messages")) return messages(j, r);
+    if (!strcmp(key, "model")) return j_peek(j) == '"' ? j_str(j, &r->model) : j_skip(j);
     if (!strcmp(key, "stream")) {
         if (j_lit(j, "true")) r->stream = 1;
         else if (j_lit(j, "false")) r->stream = 0;
@@ -435,6 +463,7 @@ static int request_field(Json* j, const char* key, void* user) {
 static void request_free(Request* r) {
     for (int i = 0; i < r->n; i++) free(r->msg[i].text.p);
     free(r->msg);
+    free(r->model.p);
 }
 
 // ---- chat completions ------------------------------------------------------------------------------------------
@@ -475,13 +504,14 @@ typedef struct {
     uint8_t pend[8];    // stream: the bytes of a UTF-8 character not complete yet
     int npend;
     int gone;           // stream: the client closed the connection
+    const char* model;
 } Out;
 
 // One chunk of the stream: delta is the JSON of the delta object, finish NULL = null; usage only with a finish.
 static void chunk(Out* o, const char* delta, size_t dn, const char* finish, int prompt) {
     Buf b = {0};
     buf_printf(&b, "data: {\"id\":\"chatcmpl-%d\",\"object\":\"chat.completion.chunk\",\"created\":%d,"
-                   "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":", o->id, CREATED, MODEL_ID);
+                   "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":", o->id, CREATED, o->model);
     buf_put(&b, delta, dn);
     if (finish)
         buf_printf(&b, ",\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
@@ -620,6 +650,24 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
         request_free(&r);
         return;
     }
+    const char* want_model = r.model.p ? r.model.p : "";
+    if (*want_model && strcmp(want_model, cfg->model)) {   // another model: loaded first (~40 s for the 9B)
+        if (!model_exists(want_model)) {
+            reply_error(fd, 404, "model_not_found", "no such model on the console (GET /v1/models lists them)");
+            request_free(&r);
+            return;
+        }
+        say("server: loading %s instead of %s", want_model, cfg->model);
+        cached = snap_n = 0;
+        uint32_t* nc = NULL;
+        if (cfg->load(cfg, want_model) || !(nc = realloc(cache, (cfg->eng->ctx_limit + 32) * sizeof(uint32_t)))) {
+            reply_error(fd, 500, "server_error", cfg->eng->error[0] ? cfg->eng->error : "the model did not load");
+            request_free(&r);
+            return;
+        }
+        cache = nc;
+        say("server: %s loaded, context %u", cfg->model, cfg->eng->ctx_limit);
+    }
     int max = (int)e->ctx_limit + 32;   // (the cache has the same size)
     uint32_t* ids = malloc(max * sizeof(uint32_t));
     int n = ids ? render(cfg, &r, ids, max) : max;
@@ -633,7 +681,7 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
     long want = r.max_completion >= 0 ? r.max_completion : r.max_tokens >= 0 ? r.max_tokens : cfg->max_reply;
     int max_new = want < (long)e->ctx_limit - 1 - n ? (int)want : (int)e->ctx_limit - 1 - n;
     uint32_t seed = r.has_seed ? (uint32_t)r.seed : (uint32_t)st->served + 1;
-    Out o = {{0}, 0, fd, r.stream, st->served + 1, {0}, 0, 0};
+    Out o = {{0}, 0, fd, r.stream, st->served + 1, {0}, 0, 0, cfg->model};
     const char* finish = "stop";
     double t0 = now_s();
     if (r.stream) {
@@ -674,7 +722,7 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
         Buf b = {0};
         buf_printf(&b, "{\"id\":\"chatcmpl-%d\",\"object\":\"chat.completion\",\"created\":%d,\"model\":\"%s\","
                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":", st->served + 1,
-                   CREATED, MODEL_ID);
+                   CREATED, cfg->model);
         json_str(&b, o.text.p ? o.text.p : "", o.text.n);
         buf_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                        "\"total_tokens\":%d}}", finish, n, o.completion, n + o.completion);
@@ -690,6 +738,123 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
     free(o.text.p);
     free(ids);
     request_free(&r);
+}
+
+// ---- embeddings ---------------------------------------------------------------------------------------------------
+
+typedef struct {
+    Buf* in;            // the texts
+    int n, cap;
+    int not_text;       // input had token arrays (not supported)
+    Buf model, format;
+    long dims;          // "dimensions": the first this many, normalised again (Matryoshka); -1 = all
+} Embed;
+
+static int embed_input(Json* j, Embed* r) {
+    Buf t = {0};
+    if (j_peek(j) == '"') {
+        if (!j_str(j, &t)) return 0;
+    } else {
+        r->not_text = 1;
+        return j_skip(j);
+    }
+    if (r->n == r->cap) {
+        int cap = r->cap ? r->cap * 2 : 8;
+        Buf* m = realloc(r->in, cap * sizeof(Buf));
+        if (!m) return free(t.p), 0;
+        r->in = m, r->cap = cap;
+    }
+    if (!t.p) buf_puts(&t, "");
+    r->in[r->n++] = t;
+    return 1;
+}
+
+static int embed_field(Json* j, const char* key, void* user) {
+    Embed* r = user;
+    double v;
+    if (j_peek(j) == 'n') return j_lit(j, "null");
+    if (!strcmp(key, "input")) {
+        if (!j_eat(j, '[')) return embed_input(j, r);
+        if (j_eat(j, ']')) return 1;
+        do {
+            if (!embed_input(j, r)) return 0;
+        } while (j_eat(j, ','));
+        return j_eat(j, ']');
+    }
+    if (!strcmp(key, "model")) return j_peek(j) == '"' ? j_str(j, &r->model) : j_skip(j);
+    if (!strcmp(key, "encoding_format")) return j_peek(j) == '"' ? j_str(j, &r->format) : j_skip(j);
+    if (!strcmp(key, "dimensions")) {
+        if (!j_num(j, &v)) return 0;
+        r->dims = v < 1 ? 1 : (long)v;
+        return 1;
+    }
+    return j_skip(j);
+}
+
+static void base64(Buf* b, const uint8_t* p, size_t n) {
+    static const char a[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16 | (i + 1 < n ? p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        char o[4] = {a[v >> 18], a[v >> 12 & 63], i + 1 < n ? a[v >> 6 & 63] : '=', i + 2 < n ? a[v & 63] : '='};
+        buf_put(b, o, 4);
+    }
+}
+
+// POST /v1/embeddings: input a string or an array of strings; floats or base64 (little-endian float32, as OpenAI)
+static void embeddings(ServerConfig* cfg, int fd, const char* body, size_t len) {
+    Embed r = {NULL, 0, 0, 0, {0}, {0}, -1};
+    Json j = {body, body + len, 0};
+    int ok = j_object(&j, embed_field, &r) && j_peek(&j) == -1;
+    const char* why = !ok ? "the body is not valid JSON" : r.not_text ? "input: only strings (no token arrays)"
+                    : !r.n ? "input is missing or empty" : NULL;
+    int code = 400;
+    const char* type = "invalid_request_error";
+    if (!why && !cfg->embed_model[0]) why = "no embedding model on the console", code = 404, type = "model_not_found";
+    if (!why && r.model.p && r.model.p[0] && strcmp(r.model.p, cfg->embed_model))
+        why = "no such embedding model (GET /v1/models lists them)", code = 404, type = "model_not_found";
+    int b64 = r.format.p && !strcmp(r.format.p, "base64");
+    float* v = malloc(cfg->embed_dim * sizeof(float));
+    if (!why && !v) why = "out of memory", code = 500, type = "server_error";
+    Buf b = {0};
+    int total = 0, dim = r.dims > 0 && r.dims < cfg->embed_dim ? (int)r.dims : cfg->embed_dim;
+    double t0 = now_s();
+    if (!why) buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    for (int i = 0; !why && i < r.n; i++) {
+        int nt = 0;
+        if (cfg->embed(cfg, r.in[i].p, v, &nt)) {
+            why = "the embedding failed", code = 500, type = "server_error";
+            break;
+        }
+        total += nt;
+        if (dim < cfg->embed_dim) {   // (Matryoshka: the first dims, unit length again)
+            double s = 0;
+            for (int k = 0; k < dim; k++) s += (double)v[k] * v[k];
+            float f = s > 0 ? (float)(1.0 / sqrt(s)) : 0.0f;
+            for (int k = 0; k < dim; k++) v[k] *= f;
+        }
+        buf_printf(&b, "%s{\"object\":\"embedding\",\"index\":%d,\"embedding\":", i ? "," : "", i);
+        if (b64) {
+            buf_puts(&b, "\"");
+            base64(&b, (const uint8_t*)v, dim * sizeof(float));
+            buf_puts(&b, "\"");
+        } else {
+            buf_puts(&b, "[");
+            for (int k = 0; k < dim; k++) buf_printf(&b, k ? ",%.7g" : "%.7g", (double)v[k]);
+            buf_puts(&b, "]");
+        }
+        buf_puts(&b, "}");
+    }
+    if (why) {
+        reply_error(fd, code, type, why);
+    } else {
+        buf_printf(&b, "],\"model\":\"%s\",\"usage\":{\"prompt_tokens\":%d,\"total_tokens\":%d}}", cfg->embed_model, total,
+                   total);
+        reply_json(fd, 200, &b);
+        say("server: %d embeddings, %d tokens in %.2f s", r.n, total, now_s() - t0);
+    }
+    free(b.p), free(v);
+    for (int i = 0; i < r.n; i++) free(r.in[i].p);
+    free(r.in), free(r.model.p), free(r.format.p);
 }
 
 // ---- one connection --------------------------------------------------------------------------------------------
@@ -771,8 +936,11 @@ static void route(ServerConfig* cfg, ServerStatus* st, Conn* c) {
     int get = mlen == 3 && memcmp(c->buf, "GET", 3) == 0, post = mlen == 4 && memcmp(c->buf, "POST", 4) == 0;
     say("server: %.*s %.*s (%u bytes)", (int)mlen, c->buf, (int)plen, path, (unsigned)c->body);
     if (plen == 10 && memcmp(path, "/v1/models", 10) == 0) {
-        if (get) models(c->fd);
+        if (get) models(cfg, c->fd);
         else reply_error(c->fd, 405, "method_not_allowed", "use GET for /v1/models");
+    } else if (plen == 14 && memcmp(path, "/v1/embeddings", 14) == 0) {
+        if (post) embeddings(cfg, c->fd, c->buf + c->head, c->body);
+        else reply_error(c->fd, 405, "method_not_allowed", "use POST for /v1/embeddings");
     } else if (plen == 20 && memcmp(path, "/v1/chat/completions", 20) == 0) {
         if (post) completions(cfg, st, c->fd, c->buf + c->head, c->body);
         else reply_error(c->fd, 405, "method_not_allowed", "use POST for /v1/chat/completions");

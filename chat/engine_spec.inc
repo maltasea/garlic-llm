@@ -59,6 +59,7 @@ typedef struct {
     // positions, so for the head this is the same as a conversation that began there.
     uint32_t pbase;
     uint32_t stop_rows[4];
+    const Engine* owner;          // the engine the head belongs to (an embedding model's engine has none)
     // statistics since the last spec_stats_reset
     uint64_t cycles, proposed, kept, tokens;
     double gpu_v, gpu_d, wall;
@@ -78,6 +79,7 @@ static const GpuKernel* kern_opt(Engine* e, const char* name) {
 int spec_init(Engine* e, const char* dir) {
     Spec* s = &g_spec;
     memset(s, 0, sizeof(*s));
+    s->owner = e;
     char p[256];
     size_t sz;
     snprintf(p, sizeof(p), "%s/mtp.idx", dir);
@@ -89,7 +91,7 @@ int spec_init(Engine* e, const char* dir) {
     memcpy(&s->nd, d + 4, 4);
     memcpy(s->path, d + 8, 128);
     s->path[128] = 0;
-    weights_locate(s->path);
+    weights_locate(s->path, dir);
     memcpy(&s->wsize, d + 136, 8);
     memcpy(&s->tsize, d + 144, 8);
     for (int i = 0; i < MT_N; i++) {
@@ -236,15 +238,15 @@ int spec_start(Engine* e) {
 }
 
 void spec_unload(Engine* e) {
-    (void)e;
+    if (e != g_spec.owner) return;
     g_spec.ready = g_spec.on = g_spec.drafted = 0;
 }
 
-int spec_active(const Engine* e) { (void)e; return g_spec.ready && g_spec.on && g_spec.kmax > 0; }
+int spec_active(const Engine* e) { return e == g_spec.owner && g_spec.ready && g_spec.on && g_spec.kmax > 0; }
 
 // A new conversation (engine_reset): from position 0 every pair goes into the head's cache.
 static void spec_reset(Engine* e) {
-    (void)e;
+    if (e != g_spec.owner) return;
     g_spec.on = g_spec.ready;
     g_spec.pbase = 0;
     g_spec.drafted = 0;

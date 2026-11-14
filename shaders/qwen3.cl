@@ -5,7 +5,9 @@
 
 #define HEAD_DIM 128
 #define ROPE_DIM 128
-#define MAX_SEQ 2048
+#ifndef MAX_SEQ
+#define MAX_SEQ 2048            // (-DMAX_SEQ=1024: the embedder's kernels, pc/convert_gguf.py)
+#endif
 
 #include "common.h"
 #include "attn.h"

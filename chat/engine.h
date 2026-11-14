@@ -110,8 +110,16 @@ typedef struct {
 
 // Direct memory engine_init leaves to the system (MiB; main.c sets it before engine_init).
 extern int eng_margin_mb;
-// Reads model.idx and kernels.bin from assets_dir, reserves GPU memory and loads the weights file.
-int engine_init(Engine* e, const char* assets_dir, ProgressFn progress, void* user);
+// Reserves GPU memory, reads kernels.bin from assets_dir and model.idx from model_dir and loads the weights file.
+int engine_init(Engine* e, const char* assets_dir, const char* model_dir, ProgressFn progress, void* user);
+// Another model in the same GPU memory (everything set up again; after it engine_ctx and the MTP head as after
+// engine_init). On failure the engine holds no model: load one again before using it.
+int engine_load(Engine* e, const char* assets_dir, const char* model_dir, ProgressFn progress, void* user);
+// A second engine (the embedding model, Qwen3) in [mem, mem + size) of the first one's block (engine_alloc);
+// engine_need: the size it takes, from model_dir/model.idx (0 = cannot tell, or a Qwen3.5 model).
+int engine_init_at(Engine* e, uint64_t mem, uint64_t size, const char* assets_dir, const char* model_dir,
+                   ProgressFn progress, void* user);
+uint64_t engine_need(const char* model_dir);
 // Runs n tokens through the model starting at position pos0 and samples the token after the last one.
 // temperature 0 = greedy. Returns 0 and the sampled token in *next, or -1 with e->error set.
 // (n >= 4 goes through the layers in batches of up to 32 tokens, shaders/prefill.h, unless e->pf_off.)

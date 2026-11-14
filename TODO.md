@@ -18,6 +18,6 @@ Tried, no gain: MTP theta 0.3–0.9, K=3, sleeping instead of spinning while the
 context), but the GPU answers "!!!!": NaN in every value already after layer 0's attention-add. A numpy forward
 on the same weights.bin (scratch `phi_ref.py`) answers right ("The capital of France is Paris."); the 15 prompt
 tokens match; K max 20, V max 6.4 (no fp16 overflow). Kernels read without finding it: matvec_q4, rmsnorm,
-embed_q4, silu, attn_part (gq=3), qk_rope_cache with ATTN_NO_QK_NORM. Next step if picked up: the debug build's
-layer-0 checkpoints (`/data/garlic_debug.txt` on) against the reference for the last token: x in 0.1207,
+embed_q4, silu, attn_part (gq=3), qk_rope_cache with ATTN_NO_QK_NORM. Next step if picked up: copy the last token's
+layer-0 values to a debug buffer (the debug code was never committed) and compare with the reference: x in 0.1207,
 x normed 2.943, qkv 16.24, after rope ?, attention 1.384, o 1.659 (max abs).

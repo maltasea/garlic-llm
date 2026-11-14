@@ -29,7 +29,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-from q4 import quantize_q4  # noqa: E402
+from q4 import pad128, q4_of, quantize_q4, to_q4s  # noqa: E402
 
 SRC = ROOT / "models" / "qwen3.5-9b-mix.bin"
 META = json.loads((ROOT / "models" / "qwen3.5-9b-mix.json").read_text())
@@ -40,19 +40,6 @@ IDX_OUT = ROOT / "chat" / "assets_9b"
 HF = "https://huggingface.co/Qwen/Qwen3.5-9B/resolve/main/"
 HF_INDEX = json.loads((ROOT / "models" / "Qwen3.5-9B" / "model.safetensors.index.json").read_text())["weight_map"]
 FMT = {"q4": 2, "q8": 1, "q4i": 3, "q4row": 4, "q3i": 5, "q4s": 6, "ids": 7, "q3s": 8}
-
-
-def to_q4s(q, d):
-    """q [rows, cols] nibbles 0..15, d [rows, nb] fp16 -> (q4s words bytes, scale bytes); rows % 128 == 0."""
-    rows, cols = q.shape
-    T, nb = rows // 128, cols // 32
-    q = q.astype(np.uint32).reshape(T, 2, 64, nb, 8, 4)          # tile, A/B, lane, block, word k, nibble i
-    half = q[..., 0] | (q[..., 1] << 4) | (q[..., 2] << 8) | (q[..., 3] << 12)
-    words = half[:, 0] | (half[:, 1] << 16)                       # T, lane, block, word
-    words = words.reshape(T, 64, nb, 2, 4).transpose(0, 2, 3, 1, 4)    # T, block, h, lane, 4 words
-    d = d.astype(np.float16).view(np.uint16).astype(np.uint32).reshape(T, 2, 64, nb)
-    sc = (d[:, 0] | (d[:, 1] << 16)).transpose(0, 2, 1)          # T, block, lane
-    return np.ascontiguousarray(words).tobytes(), np.ascontiguousarray(sc).tobytes()
 
 
 def from_q4s(wb, sb, rows, cols):
@@ -144,15 +131,6 @@ def q3s_emulate(wb, sb, rows, cols, x8, init):
     return lo, hi                                                  # [T, nb, 64] sums for rows A and B
 
 
-def pad128(q, d):
-    rows = q.shape[0]
-    p = (-rows) % 128
-    if p:
-        q = np.concatenate([q, np.full((p, q.shape[1]), 8, np.uint8)])          # (q - 8) * d = 0
-        d = np.concatenate([d, np.full((p, d.shape[1]), 6.2e-5, np.float16)])
-    return q, d
-
-
 _headers = {}
 
 
@@ -178,13 +156,6 @@ def hf_tensor(name):
             print("  retry", name, ex, flush=True)
     u16 = np.frombuffer(raw, np.uint16).astype(np.uint32) << 16
     return u16.view(np.float32).reshape(e["shape"])
-
-
-def q4_of(w):
-    packed, d16 = quantize_q4(w)
-    rows = w.shape[0]
-    p = packed.reshape(rows, -1, 16)
-    return np.concatenate([p & 15, p >> 4], axis=2).reshape(rows, -1), d16
 
 
 def gate_up(i):

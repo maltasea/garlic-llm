@@ -533,7 +533,7 @@ void draw_loading(float frac, const char* what) {
     char line_[160];
     snprintf(line_, sizeof(line_), "%s…  %d %%", what, (int)(clamp01(frac) * 100));
     draw_center(&font_small, cx, y + 30, line_, C_TEXT_DIM);
-    draw_center(&font_small, cx, SCREEN_H - 90, "Qwen3.5  ·  Parakeet  ·  Chatterbox", C_TEXT_MUTED);
+    draw_center(&font_small, cx, SCREEN_H - 90, "Qwen3.5", C_TEXT_MUTED);
 }
 
 void draw_error(const char* what) {
@@ -545,7 +545,7 @@ void draw_error(const char* what) {
     draw_center(&font_small, cx, y + font_big.line + 80, tr(S_ERROR_HINT), C_TEXT_MUTED);
 }
 
-void draw_server(const char* ip, int port, int busy, int served) {
+void draw_server(const char* ip, int port, int busy, int served, const char* models) {
     if (!ip || !*ip) ip = "0.0.0.0";
     draw_background();
     brand_block(170);
@@ -558,4 +558,5 @@ void draw_server(const char* ip, int port, int busy, int served) {
     draw_center(&font_small, cx, y + 60 + font_big.line + 30, t, busy ? C_ACCENT_HI : C_TEXT_DIM);
     snprintf(t, sizeof(t), tr(S_SERVER_HINT), ip, port);
     draw_center(&font_small, cx, y + 60 + font_big.line + 90, t, C_TEXT_MUTED);
+    if (models && *models) draw_center(&font_small, cx, y + 60 + font_big.line + 150, models, C_TEXT_DIM);
 }

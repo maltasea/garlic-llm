@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <math.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <orbis/SystemService.h>
 #include <orbis/VideoOut.h>
@@ -170,22 +173,160 @@ static Tokenizer tok;
 
 static int encode_into(uint32_t* ids, int n, int max, const char* text) { return n + tok_encode(&tok, text, ids + n, max - n); }
 
+static int shown = -1;   // what the server screen shows (-1: draw it again)
+
 static int server_frame(void* user, const ServerStatus* st) {
-    static int shown = -1;
     static char ip[16];
-    (void)user;
+    const ServerConfig* cfg = user;
     // A frame only when what it shows changes (while answering, present would wait for the TV's refresh, up to 16 ms
     // per token); idle, the server checks for a connection 50 times a second and sleeps in between
     int now_shown = st->busy ? -2 - st->served : st->served;
     if (now_shown != shown || strcmp(ip, st->ip)) {
         shown = now_shown;
         memcpy(ip, st->ip, sizeof(ip));
-        draw_server(st->ip, st->port, st->busy, st->busy ? st->served + 1 : st->served);
+        char models[200];   // what is loaded: the chat model, its context, the embedding model
+        int n = snprintf(models, sizeof(models), "%s · %uK context", cfg->model, eng.ctx_limit / 1024);
+        if (cfg->embed_model[0]) snprintf(models + n, sizeof(models) - n, " · embeddings: %s", cfg->embed_model);
+        draw_server(st->ip, st->port, st->busy, st->busy ? st->served + 1 : st->served, models);
         present();
     } else if (!st->busy) {
         sceKernelUsleep(20000);
     }
     return 0;   // the server runs until the app is closed
+}
+
+// The tokenizer: the model folder's tokenizer.bin, else the package's (every Qwen3.5 size has the same)
+static int load_tokenizer(const char* dir) {
+    static uint8_t* data;
+    char p[160];
+    size_t size;
+    snprintf(p, sizeof(p), "%s/tokenizer.bin", dir);
+    uint8_t* d = read_all(p, &size);
+    if (!d) d = read_all(ASSETS "/tokenizer.bin", &size);
+    Tokenizer t;
+    if (!d || tok_load(&t, d, size)) {
+        free(d);
+        return -1;
+    }
+    tok_free(&tok);
+    free(data);
+    data = d, tok = t;
+    return 0;
+}
+
+// ---- the embedding model: a folder of MODELS_DIR with embedding.txt (pc/convert_gguf.py), in the chat model's block
+
+static Engine emb;
+static Tokenizer etok;
+
+static int embed_text(ServerConfig* cfg, const char* text, float* out, int* tokens) {
+    (void)cfg;
+    int max = (int)emb.max_seq;
+    uint32_t* ids = malloc(max * sizeof(uint32_t));
+    if (!ids) return -1;
+    int n = tok_encode(&etok, text ? text : "", ids, max - 1);
+    if (n < 0) n = 0;
+    ids[n++] = emb.eos2;   // (Qwen3-Embedding: the text, then <|endoftext|>, whose state is the embedding)
+    uint32_t next;
+    engine_reset(&emb);
+    int r = engine_run(&emb, ids, n, 0, 0.0f, 0, &next);
+    free(ids);
+    if (r) return say("embedding: %s", emb.error), -1;
+    const volatile float* x = (const volatile float*)(uintptr_t)emb.xn;   // the final norm at the last token
+    double s = 0;
+    for (uint32_t k = 0; k < emb.hidden; k++) out[k] = x[k], s += (double)out[k] * out[k];
+    float f = s > 0 ? (float)(1.0 / sqrt(s)) : 0.0f;
+    for (uint32_t k = 0; k < emb.hidden; k++) out[k] *= f;
+    *tokens = n;
+    return 0;
+}
+
+// The first folder with embedding.txt, loaded into the chat model's GPU block (before engine_ctx takes the rest)
+static void load_embedder(ServerConfig* cfg) {
+    static uint8_t* tdata;
+    cfg->embed_model[0] = 0;
+    DIR* d = opendir(MODELS_DIR);
+    char dir[160] = "";
+    for (struct dirent* x; d && (x = readdir(d));) {
+        if (x->d_name[0] == '.') continue;
+        char p[192];
+        snprintf(p, sizeof(p), MODELS_DIR "/%s/embedding.txt", x->d_name);
+        int f = open(p, O_RDONLY);
+        if (f < 0) continue;
+        close(f);
+        snprintf(dir, sizeof(dir), MODELS_DIR "/%s", x->d_name);
+        snprintf(cfg->embed_model, sizeof(cfg->embed_model), "%s", x->d_name);
+        break;
+    }
+    if (d) closedir(d);
+    if (!dir[0]) return;
+    char p[192];
+    size_t size;
+    snprintf(p, sizeof(p), "%s/tokenizer.bin", dir);
+    tok_free(&etok);
+    free(tdata);
+    tdata = read_all(p, &size);
+    uint64_t need = engine_need(dir), base = need ? engine_alloc(&eng, need) : 0;
+    if (!tdata || tok_load(&etok, tdata, size) || !base ||
+        engine_init_at(&emb, base, need, dir, dir, loading, (void*)tr(S_LOADING_MODEL))) {
+        say("embedding model %s: %s", cfg->embed_model, !tdata ? "no tokenizer.bin" : !base ? "no memory" : emb.error);
+        cfg->embed_model[0] = 0;
+        return;
+    }
+    cfg->embed_dim = (int)emb.hidden, cfg->embed = embed_text;
+    say("embedding model %s: %u MiB, dimension %u, up to %u tokens", cfg->embed_model, (unsigned)(need >> 20), emb.hidden,
+        emb.max_seq - 1);
+}
+
+// Model `id` (MODEL_ID: the package's idx files; else the folder MODELS_DIR/id) with its context and MTP head, into
+// the engine's GPU memory; the last one loaded is the next start's (MODELS_DIR/default.txt).
+static int load_model(ServerConfig* cfg, const char* id) {
+    char dir[160], p[200];
+    size_t n;
+    if (strcmp(id, MODEL_ID)) snprintf(dir, sizeof(dir), MODELS_DIR "/%s", id);
+    else snprintf(dir, sizeof(dir), "%s", ASSETS);
+    say("model: %s (%s)", id, dir);
+    shown = -1;
+    if (load_tokenizer(dir)) return snprintf(eng.error, sizeof(eng.error), "no tokenizer for %s", id), -1;
+    say("tokenizer: %u tokens", tok.n_vocab);
+    int r = eng.mem ? engine_load(&eng, ASSETS, dir, loading, (void*)tr(S_LOADING_MODEL))
+                    : engine_init(&eng, ASSETS, dir, loading, (void*)tr(S_LOADING_MODEL));
+    if (r) return -1;
+    uint64_t per_block = 0, reserve = 0;
+#ifdef GARLIC_SPEC
+    int spec = !spec_init(&eng, dir);
+    if (spec) reserve = spec_need(&eng, &per_block);
+#endif
+    load_embedder(cfg);
+    // the state snapshot of the server (+ the MTP head's carry, which engine_state_size counts once the head is in)
+    uint64_t snap = engine_alloc(&eng, engine_state_size(&eng) + eng.hidden * 4);
+    if (engine_ctx(&eng, per_block, reserve)) return -1;
+    say("language model ready; GPU memory used %u of %u MiB; context cache %s, %u tokens",
+        (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20), eng.tq ? "TurboQuant 4-bit" : "fp16 k + int8 v",
+        eng.ctx_limit);
+#ifdef GARLIC_SPEC
+    if (!spec || spec_start(&eng)) say("spec: no MTP head (mtp.idx, the q4s model or memory missing)");
+#endif
+    say("GPU memory used: %u of %u MiB", (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20));
+    cfg->im_start = eng.im_start, cfg->im_end = eng.im_end, cfg->snap = snap;
+    snprintf(cfg->model, sizeof(cfg->model), "%s", id);
+    mkdir(MODELS_DIR, 0777);
+    int f = open(MODELS_DIR "/default.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (f >= 0) write(f, id, strlen(id)), close(f);
+    return 0;
+}
+
+// A switch that failed: back to the model before it (or to the built-in one)
+static int load_or_back(ServerConfig* cfg, const char* id) {
+    char before[64];
+    snprintf(before, sizeof(before), "%s", cfg->model);
+    if (!load_model(cfg, id)) return 0;
+    char why[160];
+    snprintf(why, sizeof(why), "%s", eng.error);
+    say("model %s: %s", id, why);
+    if (load_model(cfg, before) && load_model(cfg, MODEL_ID)) show_error(eng.error);
+    snprintf(eng.error, sizeof(eng.error), "%s", why);
+    return -1;
 }
 
 int main(void) {
@@ -206,28 +347,20 @@ int main(void) {
     }
     sceSystemServiceHideSplashScreen();   // the system shows pic1.png until the app says it is drawing
     loading((void*)tr(S_PREPARING), 0.0f, NULL);
-    size_t tsize;
-    uint8_t* tdata = read_all(ASSETS "/tokenizer.bin", &tsize);
-    if (!tdata || tok_load(&tok, tdata, tsize)) show_error("tokenizer.bin");
-    say("tokenizer: %u tokens", tok.n_vocab);
     eng_margin_mb = 64 - ui_screen_pool_mb();   // (the screen block came out of the system's 64 MiB)
-    if (engine_init(&eng, ASSETS, loading, (void*)tr(S_LOADING_MODEL))) show_error(eng.error);
-    uint64_t per_block = 0, reserve = 0;
-#ifdef GARLIC_SPEC
-    int spec = !spec_init(&eng, ASSETS);
-    if (spec) reserve = spec_need(&eng, &per_block);
-#endif
-    // the state snapshot of the server (+ the MTP head's carry, which engine_state_size counts once the head is in)
-    uint64_t snap = engine_alloc(&eng, engine_state_size(&eng) + eng.hidden * 4);
-    if (engine_ctx(&eng, per_block, reserve)) show_error(eng.error);
-    say("language model ready; GPU memory used %u of %u MiB; context cache %s, %u tokens",
-        (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20), eng.tq ? "TurboQuant 4-bit" : "fp16 k + int8 v",
-        eng.ctx_limit);
-#ifdef GARLIC_SPEC
-    if (!spec || spec_start(&eng)) say("spec: no MTP head (mtp.idx, the q4s model or memory missing)");
-#endif
-    say("GPU memory used: %u of %u MiB", (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20));
-    ServerConfig cfg = {&eng, &tok, eng.im_start, eng.im_end, THINK, THINK_END, MAX_REPLY, encode_into, server_frame, NULL, snap};
+    ServerConfig cfg = {.eng = &eng, .tok = &tok, .think = THINK, .think_end = THINK_END, .max_reply = MAX_REPLY,
+                        .encode = encode_into, .frame = server_frame, .load = load_or_back};
+    cfg.user = &cfg;
+    char id[64] = MODEL_ID;
+    size_t n;
+    char* d = (char*)read_all(MODELS_DIR "/default.txt", &n);   // the model of the last run
+    while (d && n && (d[n - 1] == '\n' || d[n - 1] == '\r' || d[n - 1] == ' ')) n--;
+    if (d && n && n < sizeof(id)) memcpy(id, d, n), id[n] = 0;
+    free(d);
+    if (load_model(&cfg, id)) {
+        say("model %s: %s", id, eng.error);
+        if (!strcmp(id, MODEL_ID) || load_model(&cfg, MODEL_ID)) show_error(eng.error);
+    }
     if (server_run(&cfg)) show_error(eng.error);
     for (;;) sceKernelUsleep(1000000);
 }

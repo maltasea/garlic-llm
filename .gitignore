@@ -9,3 +9,4 @@ toolchain/
 models/
 third_party/
 pc/fonts_libres/
+.venv/
