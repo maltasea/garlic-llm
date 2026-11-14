@@ -15,6 +15,7 @@ typedef struct {
     uint32_t* rank;              // merge rank (lower merges first)
     uint32_t* merged;            // resulting token id
     uint32_t mask;
+    int num_run;                 // digits per pre-token: 1 (Qwen), 3 (LFM2's "PTK3" files)
 } Tokenizer;
 
 // data must stay alive while the tokenizer is used; returns 0 on success

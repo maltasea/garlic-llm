@@ -151,6 +151,7 @@ int engine_ctx(Engine* e, uint64_t per_block, uint64_t reserve) {
     uint64_t used = ((e->next + 255) & ~255ull) + part + reserve + slack;
     uint64_t nb = used < e->mem_size ? (e->mem_size - used) / per : 0;
     if (nb > TQ_NB_MAX) nb = TQ_NB_MAX;
+    if (e->ctx_cap && nb > (e->ctx_cap + 8191) / 8192) nb = (e->ctx_cap + 8191) / 8192;
     if (!nb) {
         fail(e, "no memory left for the context (%u MiB free)", (unsigned)((e->mem_size - e->next) >> 20));
         return -1;
@@ -170,7 +171,7 @@ int engine_ctx(Engine* e, uint64_t per_block, uint64_t reserve) {
             e->vc[i] = e->kc[i] + kb;
             j++;
         }
-    e->ctx_limit = e->max_seq;
+    e->ctx_limit = e->ctx_cap && e->ctx_cap < e->max_seq ? e->ctx_cap : e->max_seq;
     return 0;
 }
 
@@ -273,6 +274,7 @@ static int load_kernels(Engine* e, const char* dir) {
     e->k_add = kernel(e, "add");
     e->k_mv = kernel(e, "matvec_q4");
     e->k_sample = kernel(e, "sample");
+    if (e->lfm && !(e->k_short = kernel(e, "short_conv"))) return -1;
     if (e->qwen35) {
         e->k_sig = kernel(e, "mul_sigmoid");
         e->k_conv = kernel(e, "conv_silu");
@@ -320,11 +322,12 @@ static int load_index(Engine* e, const char* dir) {
     size_t size;
     snprintf(path, sizeof(path), "%s/model.idx", dir);
     uint8_t* d = read_file(path, &size);
-    if (!d || (memcmp(d, "PMDL", 4) && memcmp(d, "PMQ5", 4))) {
+    if (!d || (memcmp(d, "PMDL", 4) && memcmp(d, "PMQ5", 4) && memcmp(d, "PML2", 4))) {
         fail(e, "cannot read %s", path);
         return -1;
     }
     e->qwen35 = !memcmp(d, "PMQ5", 4);
+    e->lfm = !memcmp(d, "PML2", 4);
     uint32_t v[10];
     memcpy(v, d + 4, 40);
     e->n_layers = v[0], e->hidden = v[1], e->inter = v[2], e->n_heads = v[3], e->n_kv = v[4];
@@ -346,6 +349,13 @@ static int load_index(Engine* e, const char* dir) {
         e->cpu_embed = (x[7] >> 1) & 1;
         vocab_map = (x[7] >> 2) & 1;   // lm_head trimmed, an "ids" record (row -> token id) after it
         rec0 = 224;
+    } else if (e->lfm) {   // "<8I" after the header: full_mask, im_start, bos, think, think_end, 0, 0, 0
+        uint32_t x[8];
+        memcpy(x, d + 192, 32);
+        e->full_mask = x[0], e->im_start = x[1], e->bos = x[2], e->think = x[3], e->think_end = x[4];
+        e->rope_dim = e->head_dim;
+        e->conv_n = e->hidden;   // (the short conv's state: the last 2 B*x per channel, in conv_n * 12 bytes)
+        rec0 = 224;
     } else {
         e->rope_dim = e->head_dim;
         e->full_mask = 0xFFFFFFFFu;
@@ -353,9 +363,9 @@ static int load_index(Engine* e, const char* dir) {
     }
     e->im_end = e->eos;
     e->layer_base = calloc(e->n_layers, sizeof(uint32_t));
-    for (uint32_t i = 0, b = 2; i < e->n_layers; i++) {   // full attention 8 tensors per layer, DeltaNet 10
+    for (uint32_t i = 0, b = 2; i < e->n_layers; i++) {   // full attention 8 tensors per layer, DeltaNet 10, LFM2 8
         e->layer_base[i] = b;
-        b += (e->full_mask >> i & 1) ? 8 : 10;
+        b += (e->full_mask >> i & 1) || e->lfm ? 8 : 10;
     }
     e->t = calloc(e->n_tensors, sizeof(Tensor));
     for (uint32_t i = 0; i < e->n_tensors; i++) {
@@ -450,14 +460,15 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
     // memory that is left
     if (!(e->qwen35 && e->tq)) rope_table(e);
 
-    if (e->head_dim != (e->qwen35 ? 256u : 128u) || e->n_heads / e->n_kv > 4 || e->max_seq % ATT_BLOCK) {
+    if (e->head_dim != (e->qwen35 ? 256u : e->lfm ? 64u : 128u) || e->n_heads / e->n_kv > 4 ||
+        e->max_seq % ATT_BLOCK) {
         fail(e, "model shape not supported by the kernels (max_seq %u, head_dim %u)", e->max_seq, e->head_dim);
         return -1;
     }
     // per layer: fp16 KV cache, k transposed [n_kv][head_dim][max_seq], v [max_seq][n_kv][head_dim] (shaders/attn.h);
     // or, for a Gated DeltaNet layer, the conv state [conv_n][3] and the delta-rule state [n_vh][dk][dv] (fp32)
     e->layer_cache = (uint64_t)e->max_seq * e->n_kv * e->head_dim * 2;
-    e->conv_n = 2ull * e->n_kh * e->dk + (uint64_t)e->n_vh * e->dv;
+    if (!e->lfm) e->conv_n = 2ull * e->n_kh * e->dk + (uint64_t)e->n_vh * e->dv;
     e->state_bytes = (uint64_t)e->n_vh * e->dk * e->dv * 4;
     e->kc = calloc(e->n_layers, sizeof(uint64_t));
     e->vc = calloc(e->n_layers, sizeof(uint64_t));
@@ -497,7 +508,7 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
         for (uint32_t i = 0; i < e->n_layers; i++) {
             int full = e->full_mask >> i & 1;
             e->kc[i] = gpu_alloc(e, full ? e->layer_cache : e->conv_n * 12);
-            e->vc[i] = gpu_alloc(e, full ? e->layer_cache : e->state_bytes);
+            e->vc[i] = full || !e->lfm ? gpu_alloc(e, full ? e->layer_cache : e->state_bytes) : e->kc[i];
         }
     }
     for (uint32_t i = 0; i < e->n_layers; i++)
@@ -519,7 +530,7 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
     e->staging = gpu_alloc(e, (uint64_t)stage_rows * e->hidden * 4);
     // q | k | v (| output gate, Qwen3.5); the DeltaNet input projection: q | k | v | z | b | a
     e->qkv = gpu_alloc(e, (uint64_t)(e->n_heads + 2 * e->n_kv + (e->qwen35 ? e->n_heads : 0)) * e->head_dim * 4);
-    e->lin = gpu_alloc(e, (e->conv_n + (uint64_t)e->n_vh * e->dv + 2 * e->n_vh + 64) * 4);
+    e->lin = gpu_alloc(e, (e->lfm ? 3ull * e->hidden : e->conv_n + (uint64_t)e->n_vh * e->dv + 2 * e->n_vh + 64) * 4);
     e->o = gpu_alloc(e, e->hidden * 4);
     e->gu = gpu_alloc(e, 2 * e->inter * 4);
     e->down = gpu_alloc(e, e->hidden * 4);
@@ -840,9 +851,15 @@ static void step(Engine* e, uint32_t pos, uint32_t forced, uint32_t slot, int sa
         // Gated DeltaNet:  attn_norm, mlp_norm, w_in, conv, A, dt_bias, gnorm, wout, wgu, wdown
         uint32_t b = e->layer_base[i];
         int full = e->full_mask >> i & 1;
-        uint32_t mlp = b + (full ? 6 : 8);
+        uint32_t mlp = b + (full || e->lfm ? 6 : 8);
         uint64_t kc = e->kc[i], vc = e->vc[i];
         dispatch(e, e->k_rmsnorm, args(e, "pppuf", e->x, W(e, b), e->xn, e->hidden, (double)e->eps), 1, 256);
+        if (!full && e->lfm) {   // short conv: B | C | x = in_proj xn; o = out_proj (C * conv(B * x))
+            matvec(e, b + 4, e->xn, e->lin);
+            dispatch(e, e->k_short, args(e, "pppu", e->lin, W(e, b + 2), kc, e->hidden), e->hidden / 256, 256);
+            matvec(e, b + 5, e->lin, e->o);
+            goto mlp_block;
+        }
         if (!full) {
             uint32_t vd = e->n_vh * e->dv;
             matvec(e, b + 2, e->xn, e->lin);

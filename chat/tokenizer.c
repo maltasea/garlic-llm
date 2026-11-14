@@ -6,7 +6,7 @@
 // (tried in that order at each position), then each piece's bytes are merged pairwise by merge rank.
 // Unicode classes are approximated for the scripts a chat in Latin languages needs: letters are ASCII letters
 // plus everything outside ASCII except punctuation, symbol and space blocks; numbers are ASCII digits and the
-// Latin-1 superscripts / fractions.
+// Latin-1 superscripts / fractions. A "PTK3" file (LFM2) takes numbers in runs of up to 3: \p{N}{1,3}.
 
 #include "tokenizer.h"
 
@@ -16,8 +16,9 @@
 static uint32_t rd32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
 int tok_load(Tokenizer* t, const uint8_t* data, size_t size) {
-    if (size < 12 + 1024 || memcmp(data, "PTOK", 4)) return -1;
+    if (size < 12 + 1024 || (memcmp(data, "PTOK", 4) && memcmp(data, "PTK3", 4))) return -1;
     memset(t, 0, sizeof(*t));
+    t->num_run = data[3] == '3' ? 3 : 1;
     t->n_vocab = rd32(data + 4);
     t->n_merges = rd32(data + 8);
     t->byte_id = (const uint32_t*)(data + 12);
@@ -102,7 +103,7 @@ static int is_letter(uint32_t c) {
 }
 
 // Length in bytes of the pre-token starting at byte i.
-static int pretoken(const uint8_t* s, int n, int i) {
+static int pretoken(const uint8_t* s, int n, int i, int num_run) {
     int l0, l1;
     uint32_t c = next_cp(s, n, i, &l0);
 
@@ -134,8 +135,16 @@ static int pretoken(const uint8_t* s, int n, int i) {
         }
         if (k > j) return k - i;
     }
-    // 3. \p{N}
-    if (is_num(c)) return l0;
+    // 3. \p{N} (\p{N}{1,num_run})
+    if (is_num(c)) {
+        int k = i + l0;
+        for (int m = 1; m < num_run && k < n; m++) {
+            uint32_t ck = next_cp(s, n, k, &l1);
+            if (!is_num(ck)) break;
+            k += l1;
+        }
+        return k - i;
+    }
     // 4. ' '?[^\s\p{L}\p{N}]+[\r\n]*
     {
         int j = i;
@@ -206,7 +215,7 @@ int tok_encode(const Tokenizer* t, const char* utf8, uint32_t* out, int max) {
     const uint8_t* s = (const uint8_t*)utf8;
     int n = (int)strlen(utf8), i = 0, count = 0;
     while (i < n && count < max) {
-        int l = pretoken(s, n, i);
+        int l = pretoken(s, n, i, t->num_run);
         count += bpe(t, s + i, l, out + count, max - count);
         i += l;
     }

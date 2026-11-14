@@ -32,6 +32,10 @@ typedef struct {
     // Qwen3.5 (model.idx "PMQ5"): Gated DeltaNet shape, partial RoPE, which layers are full attention
     int qwen35;
     uint32_t n_kh, n_vh, dk, dv, rope_dim, full_mask, im_start, im_end;
+    // LFM2 (model.idx "PML2"): the layers not in full_mask are short convolutions (shaders/qwen3.cl short_conv);
+    // bos starts every prompt, think / think_end: the model's (empty) think block, 0 = the server's own
+    int lfm;
+    uint32_t bos, think, think_end;
     uint32_t* layer_base;   // index in t[] of each layer's first tensor (attn_norm)
     int has_head;           // untied output head: the last tensor (Qwen3.5-9B), or the one before "ids"
     uint32_t head_idx;      // index of lm_head in t[] (0 = tied to the embedding)
@@ -65,6 +69,7 @@ typedef struct {
     // layers form one block [kv_hi, kv_hi + kv_split)
     uint64_t kv_hi, kv_split;
     uint32_t ctx_limit;           // positions the conversation may use (max_seq)
+    uint32_t ctx_cap;             // engine_ctx: at most this many positions (0 = as many as fit)
     int wait_us;                  // waiting for the GPU: sleep this long between checks (0 = spin)
     // TurboQuant 4-bit KV cache (shaders/attn_tq.h), allocated by engine_ctx
     int tq;
@@ -90,6 +95,7 @@ typedef struct {
     int nk;
     const GpuKernel *k_embed, *k_rmsnorm, *k_qk, *k_attn, *k_attn_comb, *k_silu, *k_add, *k_mv, *k_sample;
     const GpuKernel *k_sig, *k_conv, *k_delta;   // Qwen3.5 only
+    const GpuKernel* k_short;                    // LFM2 only
     const GpuKernel *k_bsum, *k_mvi, *k_mvi8;    // interleaved Q4 ("q4i", fmt 3) matrices
     const GpuKernel *k_mv3, *k_mv38, *k_copy;    // interleaved Q3 ("q3i", fmt 5); staging row -> x
     uint64_t bsum;                               // block sums of the current matrix-vector input

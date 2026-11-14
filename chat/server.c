@@ -478,16 +478,17 @@ static int snap_n;    // the model's state at position snap_n (the end of the la
 // The prompt as the chat renders it: every message, then a new assistant turn; returns its length.
 static int render(ServerConfig* cfg, const Request* r, uint32_t* ids, int max) {
     int n = 0;
+    if (cfg->bos) ids[n++] = cfg->bos;
     for (int i = 0; i <= r->n && n < max - 16; i++) {
         int role = i < r->n ? r->msg[i].role : ROLE_ASSISTANT;
         ids[n++] = cfg->im_start;
         n = cfg->encode(ids, n, max - 16, role_names[role]);
         n = cfg->encode(ids, n, max - 16, "\n");
-        if (role == ROLE_ASSISTANT) {   // the empty think block: the answer without thinking
+        if (role == ROLE_ASSISTANT && !(cfg->think_last && i < r->n)) {   // the empty think block: no thinking
             ids[n++] = cfg->think;
-            n = cfg->encode(ids, n, max - 16, "\n\n");
-            ids[n++] = cfg->think_end;
-            n = cfg->encode(ids, n, max - 16, "\n\n");
+            if (!cfg->think_last) n = cfg->encode(ids, n, max - 16, "\n\n");
+            ids[n++] = cfg->think_end;   // (LFM2.5 thinks anyway without the "\n" after it)
+            n = cfg->encode(ids, n, max - 16, cfg->think_last ? "\n" : "\n\n");
         }
         if (i == r->n) break;
         if (r->msg[i].text.p) n = cfg->encode(ids, n, max - 16, r->msg[i].text.p);
@@ -651,13 +652,13 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
         return;
     }
     const char* want_model = r.model.p ? r.model.p : "";
-    if (*want_model && strcmp(want_model, cfg->model)) {   // another model: loaded first (~40 s for the 9B)
+    if (*want_model && strcmp(want_model, cfg->model)) {   // another model: loaded first (~40 s for the 9B), unless loaded
         if (!model_exists(want_model)) {
             reply_error(fd, 404, "model_not_found", "no such model on the console (GET /v1/models lists them)");
             request_free(&r);
             return;
         }
-        say("server: loading %s instead of %s", want_model, cfg->model);
+        say("server: %s instead of %s", want_model, cfg->model);
         cached = snap_n = 0;
         uint32_t* nc = NULL;
         if (cfg->load(cfg, want_model) || !(nc = realloc(cache, (cfg->eng->ctx_limit + 32) * sizeof(uint32_t)))) {
@@ -665,8 +666,8 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
             request_free(&r);
             return;
         }
-        cache = nc;
-        say("server: %s loaded, context %u", cfg->model, cfg->eng->ctx_limit);
+        cache = nc, e = cfg->eng;
+        say("server: %s answers, context %u", cfg->model, cfg->eng->ctx_limit);
     }
     int max = (int)e->ctx_limit + 32;   // (the cache has the same size)
     uint32_t* ids = malloc(max * sizeof(uint32_t));

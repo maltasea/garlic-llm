@@ -26,7 +26,9 @@ typedef struct ServerConfig {
     Engine* eng;                        // the loaded model; its ctx_limit is the one enforced
     const Tokenizer* tok;
     uint32_t im_start, im_end;          // the model's chat-template tokens
-    uint32_t think, think_end;          // Qwen3.5's think / end-of-think tokens
+    uint32_t think, think_end;          // the model's think / end-of-think tokens
+    uint32_t bos;                       // the token every prompt starts with (LFM2), 0 = none
+    int think_last;                     // LFM2: "<think></think>\n" on the new turn only (Qwen3.5: every turn)
     int max_reply;                      // default completion length when the request gives none
     int (*encode)(uint32_t* ids, int n, int max, const char* text);  // appends text's tokens, returns the new count
     int (*frame)(void* user, const ServerStatus* st);                // returns 1 to leave server mode
