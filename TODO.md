@@ -12,3 +12,12 @@ GPU-bound: 41.6 ms per verify pass + 4.2 ms per draft, the GPU busy 99 % of the 
 
 Tried, no gain: MTP theta 0.3–0.9, K=3, sleeping instead of spinning while the GPU runs (`/data/garlic_tune.txt`
 "<K> <theta> <wait_us>", read before every request).
+
+## Phi-4-mini (dropped, 2026-11-14)
+`pc/convert_gguf.py` converts `~/models/Phi-4-mini-instruct-Q4_K_M.gguf` and the PS4 loads it (3569 MiB, 8K
+context), but the GPU answers "!!!!": NaN in every value already after layer 0's attention-add. A numpy forward
+on the same weights.bin (scratch `phi_ref.py`) answers right ("The capital of France is Paris."); the 15 prompt
+tokens match; K max 20, V max 6.4 (no fp16 overflow). Kernels read without finding it: matvec_q4, rmsnorm,
+embed_q4, silu, attn_part (gq=3), qk_rope_cache with ATTN_NO_QK_NORM. Next step if picked up: the debug build's
+layer-0 checkpoints (`/data/garlic_debug.txt` on) against the reference for the last token: x in 0.1207,
+x normed 2.943, qkv 16.24, after rope ?, attention 1.384, o 1.659 (max abs).
