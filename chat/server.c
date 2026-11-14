@@ -438,6 +438,10 @@ static void request_free(Request* r) {
 // ---- chat completions ------------------------------------------------------------------------------------------
 
 static int leaving;   // frame asked to leave while a request ran: the reply ends, then server mode
+// The ids in the model's cache: the last prompt and every generated id that was fed (not the final stop token,
+// sampled but never fed). A prompt that starts with exactly these is fed from where they end (server_run owns it).
+static uint32_t* cache;
+static int cached;
 
 // The prompt as the chat renders it: every message, then a new assistant turn; returns its length.
 static int render(ServerConfig* cfg, const Request* r, uint32_t* ids, int max) {
@@ -514,13 +518,23 @@ static void emit(ServerConfig* cfg, Out* o, uint32_t token) {
     free(text.p);
 }
 
-// Prompt, then one token per call until a stop. 0 = done (*finish set), -1 = engine error (eng->error).
+static void cache_add(uint32_t t, int pos) {
+    if (cached == pos) cache[cached++] = t;
+}
+
+// The prompt (only its new tail when the cache holds the rest), then the reply one token per call, several per call
+// with the MTP head. 0 = done (*finish set), -1 = engine error (eng->error).
 static int generate(ServerConfig* cfg, ServerStatus* st, const uint32_t* ids, int n, int max_new, float temperature,
                     uint32_t seed, Out* o, const char** finish) {
     Engine* e = cfg->eng;
     uint32_t next;
-    engine_reset(e);
-    if (engine_run(e, ids, n, 0, temperature, seed++, &next)) return -1;
+    int from = cached > 0 && cached < n && memcmp(ids, cache, cached * sizeof(uint32_t)) == 0 ? cached : 0;
+    if (!from) engine_reset(e);
+    say("server: prompt %d tokens, %d of them cached: feeding %d", n, from, n - from);
+    cached = 0;   // (valid again once the prompt is in)
+    if (engine_run(e, ids + from, n - from, from, temperature, seed++, &next)) return -1;
+    memcpy(cache, ids, n * sizeof(uint32_t));
+    cached = n;
     int pos = n;
     for (;;) {
         if (next == cfg->im_end || next == e->eos2) {
@@ -534,8 +548,27 @@ static int generate(ServerConfig* cfg, ServerStatus* st, const uint32_t* ids, in
         emit(cfg, o, next);
         if (cfg->frame(cfg->user, st)) leaving = 1;
         uint32_t t = next;
+#ifdef GARLIC_SPEC
+        if (spec_active(e)) {   // the MTP head drafts, the model keeps what it would have drawn itself
+            uint32_t ex[8];
+            int ne = 0;
+            if (engine_spec_step(e, t, pos, temperature, seed++, max_new - o->completion + 1, ex, &ne, &next))
+                return -1;
+            cache_add(t, pos++);
+            for (int i = 0; i < ne; i++) {
+                if (ex[i] == cfg->im_end || ex[i] == e->eos2) {   // fed already: the cache no longer matches
+                    cached = 0;
+                    *finish = "stop";
+                    return 0;
+                }
+                emit(cfg, o, ex[i]);
+                cache_add(ex[i], pos++);
+            }
+            continue;
+        }
+#endif
         if (engine_run(e, &t, 1, pos, temperature, seed++, &next)) return -1;
-        pos++;
+        cache_add(t, pos++);
     }
 }
 
@@ -553,7 +586,7 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
         request_free(&r);
         return;
     }
-    int max = (int)e->ctx_limit + 32;
+    int max = (int)e->ctx_limit + 32;   // (the cache has the same size)
     uint32_t* ids = malloc(max * sizeof(uint32_t));
     int n = ids ? render(cfg, &r, ids, max) : max;
     if (n >= (int)e->ctx_limit - 1) {
@@ -577,7 +610,7 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
         chunk(&o, first, sizeof(first) - 1, NULL, 0);
     }
     int failed = generate(cfg, st, ids, n, max_new, temperature, seed, &o, &finish);
-    if (failed) say("server: %s", e->error);
+    if (failed) say("server: %s", e->error), cached = 0;
     if (r.stream) {
         if (!failed) {
             if (o.npend) {   // a character the reply ended in the middle of
@@ -756,7 +789,14 @@ int server_run(ServerConfig* cfg) {
         free(c.buf);
         return -1;
     }
-    leaving = 0;
+    leaving = 0, cached = 0;
+    cache = malloc((cfg->eng->ctx_limit + 32) * sizeof(uint32_t));
+    if (!cache) {
+        snprintf(cfg->eng->error, sizeof(cfg->eng->error), "server: no memory for the cache ids");
+        sceNetSocketClose(ls);
+        free(c.buf);
+        return -1;
+    }
     net_ip(st.ip);
     say("server: listening on %s:%d", st.ip[0] ? st.ip : "0.0.0.0", SERVER_PORT);
     for (int turn = 1;; turn++) {
@@ -774,6 +814,8 @@ int server_run(ServerConfig* cfg) {
     conn_close(&c);
     sceNetSocketClose(ls);
     free(c.buf);
+    free(cache);
+    cache = NULL, cached = 0;
     say("server: stopped after %d requests", st.served);
     return 0;
 }
