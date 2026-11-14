@@ -1,4 +1,5 @@
-"""Build Garlic LLM (chat/*.c + MicroPython + chat/assets) as a fake PKG with the OpenOrbis toolchain (see build.py).
+"""Build Garlic LLM (chat/*.c + chat/assets) as a fake PKG with the OpenOrbis toolchain (see build.py): the model as an
+OpenAI-compatible API server on the console's LAN (chat/server.c).
 
 Run: python build_chat.py           -> build/chat/IV0000-PSAI00001_00-PS4LOCALAICHAT01.pkg ("Garlic LLM", Qwen3.5-9B)
      python build_chat.py --4b      -> "Garlic LLM 4B" (PSAI00002), a second app that installs next to the first
@@ -28,39 +29,24 @@ else:
     REMOTE = "/data/pkg/Garlic-LLM.pkg"
 FULL = "--full" in sys.argv
 # the weights of the all-in-one package (the names the .idx files give, see weights_locate)
-FULL_MODELS = (["qwen3.5-4b-q4i.bin"] if "--4b" in sys.argv else ["qwen3.5-9b-q4s.bin", "qwen3.5-9b-mtp.bin"]) +     ["parakeet-v3-q4i.bin", "chatterbox-t3.bin", "chatterbox-s3gen-mf.bin"]
+FULL_MODELS = ["qwen3.5-4b-q4i.bin"] if "--4b" in sys.argv else ["qwen3.5-9b-q4s.bin", "qwen3.5-9b-mtp.bin"]
 CONTENT_ID = f"IV0000-{TITLE_ID}_00-PS4LOCALAICHAT{SUFFIX}"
 SOURCES = sorted((ROOT / "chat").glob("*.c"))
-MP = ROOT / "chat" / "py" / "mp"
-MP_SOURCES = sorted([*(MP / "py").glob("*.c"), *(MP / "extmod").glob("*.c"), *(MP / "shared" / "runtime").glob("*.c"),
-                     ROOT / "chat" / "py" / "garlic_str.c"])
-MP_FLAGS = [f"-I{ROOT / 'chat' / 'py'}", f"-I{MP}", "-DNDEBUG", "-std=gnu99", "-fno-strict-aliasing",
-            "-Wno-unused-function", "-Wno-unused-variable", "-Wno-unused-but-set-variable"]
-LIBS = ["-lc", "-lm", "-lkernel", "-lSceGnmDriver", "-lSceVideoOut", "-lScePad", "-lSceUserService", "-lSceSysmodule",
-        "-lSceImeDialog", "-lSceCommonDialog", "-lSceAudioIn", "-lSceAudioOut", "-lSceSystemService", "-lSceNet",
-        "-lSceNetCtl"]
+LIBS = ["-lc", "-lm", "-lkernel", "-lSceGnmDriver", "-lSceVideoOut", "-lSceSystemService", "-lSceNet", "-lSceNetCtl"]
 # OpenOrbis names its macOS fself tool create-fself-macos
 CREATE_FSELF = b.BIN / ("create-fself-macos" if b.HOST == "macos" else f"create-fself{b.EXE}")
 CREATE_GP4 = b.BIN / f"create-gp4{b.EXE}"
 
 
 def compile_all():
-    """Every C file, in parallel; MicroPython's objects are kept between builds while unchanged."""
+    """Every C file, in parallel."""
     objdir = OUT / "obj"
-    objdir.mkdir(parents=True, exist_ok=True)
-    config = max(p.stat().st_mtime for p in (ROOT / "chat" / "py").glob("*.h"))
-    jobs = []
-    for src in SOURCES:
-        model = ["-DGARLIC_4B"] if "--4b" in sys.argv else []
-        jobs.append((src, objdir / (src.stem + ".o"), [*b.CFLAGS, *MP_FLAGS[:2], *model], True))
-    for src in MP_SOURCES:
-        obj = objdir / ("mp_" + src.parent.name + "_" + src.stem + ".o")
-        fresh = obj.exists() and obj.stat().st_mtime > max(src.stat().st_mtime, config)
-        jobs.append((src, obj, [*b.CFLAGS, *MP_FLAGS], not fresh))
+    shutil.rmtree(objdir, ignore_errors=True)
+    objdir.mkdir(parents=True)
+    model = ["-DGARLIC_4B"] if "--4b" in sys.argv else []
+    jobs = [(src, objdir / (src.stem + ".o"), [*b.CFLAGS, *model]) for src in SOURCES]
     running = []
-    for src, obj, flags, needed in jobs:
-        if not needed:
-            continue
+    for src, obj, flags in jobs:
         running.append((src, subprocess.Popen([str(b.ZIG), "cc", *map(str, flags), str(src), "-o", str(obj)], env=b.ENV)))
         if len(running) >= 8:
             for s, p in running:
@@ -70,11 +56,11 @@ def compile_all():
     for s, p in running:
         if p.wait():
             sys.exit(f"compile failed: {s}")
-    return [obj for _, obj, _, _ in jobs]
+    return [obj for _, obj, _ in jobs]
 
 
 def fix_gp4_dirs():
-    """create-gp4 writes a fixed folder list; the package needs the real one (assets/py/tkinter...)."""
+    """create-gp4 writes a fixed folder list; the package needs the real one."""
     gp4 = PKGDIR / "pkg.gp4"
     text = gp4.read_text(encoding="utf-8")
     start, end = text.index("<rootdir>"), text.index("</rootdir>") + len("</rootdir>")

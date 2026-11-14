@@ -1,7 +1,6 @@
 // Garlic LLM (the 9B): speculative decoding with Qwen3.5's own MTP head.
-// Included at the end of engine.c with GARLIC_SPEC (uses its dispatch / submit / swar_mm). Text chat only: the head,
-// its table of draft rows and its cache live in T3's weights memory, which only voice mode uses (spec_load lends it;
-// t3 weights are read again when voice mode starts, main.c).
+// Included at the end of engine.c with GARLIC_SPEC (uses its dispatch / submit / swar_mm). The head, its table of
+// draft rows and its cache get GPU memory of their own at start-up (spec_start).
 //
 // The MTP head (as vLLM's Qwen3_5MultiTokenPredictor): index i of its own sequence takes (h_i, x_{i+1}) - the 9B's
 // hidden state after the final norm at position i and the embedding of the next token - as
@@ -48,7 +47,7 @@ typedef struct {
     uint64_t wsize, tsize;        // tensors, draft table (nd rows of q4row) in the weights file
     uint32_t nd;                  // draft rows: the first nd rows of lm_head (the most frequent tokens)
     Tensor t[MT_N];
-    uint64_t base, size;          // the lent memory (T3's weights)
+    uint64_t base, size;          // its memory
     uint64_t model, table, kc, vc, tq_split;
     uint64_t E, Hc, X, x, xn, O, att, Q, L, raw, xs, st;
     const GpuKernel *k_emb, *k_draft, *k_accept, *k_convv, *k_commit, *k_deltav, *k_copyg, *k_rmsg;
@@ -214,6 +213,19 @@ int spec_load(Engine* e, uint64_t base, uint64_t size, int start) {
     say("spec: MTP head ready (%u MiB of the %u lent; draft rows %u, K up to %d, theta %.2f)", (unsigned)(need >> 20),
         (unsigned)(size >> 20), s->nd, s->kmax, (double)s->theta);
     return 0;
+}
+
+// The head into GPU memory of its own, at start-up (nothing else borrows it in the server app).
+int spec_start(Engine* e) {
+    if (!g_spec.idx_ok) return -1;
+    uint64_t need = spec_layout(e, 0) + 256;
+    uint64_t base = gpu_alloc(e, need);
+    if (!base) {
+        say("spec: the MTP head needs %u MiB, %u MiB free", (unsigned)(need >> 20),
+            (unsigned)((e->mem_size - e->next) >> 20));
+        return -1;
+    }
+    return spec_load(e, base, need, 0);
 }
 
 void spec_unload(Engine* e) {
@@ -566,21 +578,6 @@ void spec_stats_reset(void) {
 
 // The head's carry (h at the position before the next token) goes with the DeltaNet state ("Pensar"): 16 KiB.
 uint64_t spec_carry(void) { return g_spec.ready ? g_spec.Hc : 0; }
-
-// T3's weights read again into their memory (the head had borrowed it): ~280 MiB from the disk.
-int t3_reload(Engine* e) {
-    T3* t = &e->t3;
-    if (!t->ready || t->fd < 0) return -1;
-    uint64_t done = 0;
-    while (done < t->gpu_size) {
-        uint64_t n = t->gpu_size - done < (32ull << 20) ? t->gpu_size - done : 32ull << 20;
-        ssize_t r = pread(t->fd, (uint8_t*)(uintptr_t)t->model + done, n, (off_t)done);
-        if (r <= 0) break;
-        done += r;
-    }
-    __asm__ volatile("sfence" ::: "memory");
-    return done == t->gpu_size ? 0 : -1;
-}
 
 // The draft length cap (0 = the head off); k < 0 leaves it. Returns the previous one.
 int spec_kmax(int k) {
