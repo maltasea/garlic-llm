@@ -156,7 +156,13 @@ static Tokenizer tok;
 static int encode_into(uint32_t* ids, int n, int max, const char* text) { return n + tok_encode(&tok, text, ids + n, max - n); }
 
 static int server_frame(void* user, const ServerStatus* st) {
+    static double last;
+    static int was_busy;
     (void)user;
+    // While answering, a few frames a second: present waits for the TV's refresh, up to 16 ms per token
+    double t = now();
+    if (st->busy && was_busy && t - last < 0.25) return 0;
+    last = t, was_busy = st->busy;
     draw_server(st->ip, st->port, st->busy, st->busy ? st->served + 1 : st->served);
     present();
     return 0;   // the server runs until the app is closed
