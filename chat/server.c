@@ -462,15 +462,56 @@ static int render(ServerConfig* cfg, const Request* r, uint32_t* ids, int max) {
 }
 
 typedef struct {
-    Buf text;           // the reply so far
+    Buf text;           // plain: the reply so far
     int completion;     // tokens sent as text
+    int fd, stream, id;
+    uint8_t pend[8];    // stream: the bytes of a UTF-8 character not complete yet
+    int npend;
+    int gone;           // stream: the client closed the connection
 } Out;
+
+// One chunk of the stream: delta is the JSON of the delta object, finish NULL = null; usage only with a finish.
+static void chunk(Out* o, const char* delta, size_t dn, const char* finish, int prompt) {
+    Buf b = {0};
+    buf_printf(&b, "data: {\"id\":\"chatcmpl-%d\",\"object\":\"chat.completion.chunk\",\"created\":%d,"
+                   "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":", o->id, CREATED, MODEL_ID);
+    buf_put(&b, delta, dn);
+    if (finish)
+        buf_printf(&b, ",\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+                       "\"total_tokens\":%d}}\n\n", finish, prompt, o->completion, prompt + o->completion);
+    else
+        buf_puts(&b, ",\"finish_reason\":null}]}\n\n");
+    if (!o->gone && b.p && net_send(o->fd, b.p, b.n)) o->gone = 1;
+    free(b.p);
+}
 
 static void emit(ServerConfig* cfg, Out* o, uint32_t token) {
     const uint8_t* bytes;
     int nb = tok_piece(cfg->tok, token, &bytes);
-    if (nb > 0) buf_put(&o->text, (const char*)bytes, nb);
     o->completion++;
+    if (!o->stream) {
+        if (nb > 0) buf_put(&o->text, (const char*)bytes, nb);
+        return;
+    }
+    Buf text = {0};   // only complete UTF-8 characters go out
+    for (int i = 0; i < nb; i++) {
+        o->pend[o->npend++] = bytes[i];
+        uint8_t c0 = o->pend[0];
+        int need = c0 < 0x80 ? 1 : (c0 >> 5) == 6 ? 2 : (c0 >> 4) == 14 ? 3 : (c0 >> 3) == 30 ? 4 : 1;
+        if (o->npend >= need || o->npend == 8) {
+            buf_put(&text, (const char*)o->pend, o->npend);
+            o->npend = 0;
+        }
+    }
+    if (text.n) {
+        Buf d = {0};
+        buf_puts(&d, "{\"content\":");
+        json_str(&d, text.p, text.n);
+        buf_puts(&d, "}");
+        chunk(o, d.p, d.n, NULL, 0);
+        free(d.p);
+    }
+    free(text.p);
 }
 
 // Prompt, then one token per call until a stop. 0 = done (*finish set), -1 = engine error (eng->error).
@@ -486,7 +527,7 @@ static int generate(ServerConfig* cfg, ServerStatus* st, const uint32_t* ids, in
             *finish = "stop";
             return 0;
         }
-        if (o->completion >= max_new || pos >= (int)e->ctx_limit - 1 || leaving) {
+        if (o->completion >= max_new || pos >= (int)e->ctx_limit - 1 || leaving || o->gone) {
             *finish = "length";
             return 0;
         }
@@ -525,10 +566,32 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
     long want = r.max_completion >= 0 ? r.max_completion : r.max_tokens >= 0 ? r.max_tokens : cfg->max_reply;
     int max_new = want < (long)e->ctx_limit - 1 - n ? (int)want : (int)e->ctx_limit - 1 - n;
     uint32_t seed = r.has_seed ? (uint32_t)r.seed : (uint32_t)st->served + 1;
-    Out o = {{0}, 0};
+    Out o = {{0}, 0, fd, r.stream, st->served + 1, {0}, 0, 0};
     const char* finish = "stop";
     double t0 = now_s();
-    if (generate(cfg, st, ids, n, max_new, temperature, seed, &o, &finish)) {
+    if (r.stream) {
+        static const char head[] = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                                   "Connection: close\r\n\r\n";
+        static const char first[] = "{\"role\":\"assistant\",\"content\":\"\"}";
+        o.gone = net_send(fd, head, sizeof(head) - 1) != 0;
+        chunk(&o, first, sizeof(first) - 1, NULL, 0);
+    }
+    int failed = generate(cfg, st, ids, n, max_new, temperature, seed, &o, &finish);
+    if (failed) say("server: %s", e->error);
+    if (r.stream) {
+        if (!failed) {
+            if (o.npend) {   // a character the reply ended in the middle of
+                Buf d = {0};
+                buf_puts(&d, "{\"content\":");
+                json_str(&d, (const char*)o.pend, o.npend);
+                buf_puts(&d, "}");
+                chunk(&o, d.p, d.n, NULL, 0);
+                free(d.p);
+            }
+            chunk(&o, "{}", 2, finish, n);
+            if (!o.gone) net_send(fd, "data: [DONE]\n\n", 14);
+        }
+    } else if (failed) {
         reply_error(fd, 500, "server_error", e->error);
     } else {
         Buf b = {0};
@@ -540,9 +603,12 @@ static void completions(ServerConfig* cfg, ServerStatus* st, int fd, const char*
                        "\"total_tokens\":%d}}", finish, n, o.completion, n + o.completion);
         reply_json(fd, 200, &b);
         free(b.p);
+    }
+    if (!failed) {
         double dt = now_s() - t0;
-        say("server: %d messages, prompt %d tokens, reply %d tokens (%s) in %.1f s (%.1f tokens/s)", r.n, n,
-            o.completion, finish, dt, dt > 0 ? o.completion / dt : 0.0);
+        say("server: %d messages, prompt %d tokens, reply %d tokens (%s%s%s) in %.1f s (%.1f tokens/s)", r.n, n,
+            o.completion, finish, r.stream ? ", streamed" : "", o.gone ? ", client gone" : "", dt,
+            dt > 0 ? o.completion / dt : 0.0);
     }
     free(o.text.p);
     free(ids);
