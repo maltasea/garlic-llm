@@ -1,4 +1,4 @@
-"""A Qwen3 embedding model (Qwen3-Embedding) or an LFM2 chat model (LFM2.5) in GGUF (F32 / F16 / BF16 / Q8_0 / K-quants)
+"""A Qwen3 model (chat, or Qwen3-Embedding) or an LFM2 chat model (LFM2.5) in GGUF (F32 / F16 / BF16 / Q8_0 / K-quants)
 -> a model folder for the PS4 (chat/server.h MODELS_DIR). The embedder is served at /v1/embeddings next to the chat
 model; LFM2 is a chat model ("PML2": its short-conv layers, 64-dim heads, a CHAT_SEQ context):
   weights.bin   as pc/convert_qwen3.py --q4 (PMDL; every matrix q4, tied embedding, no lm_head of its own)
@@ -10,6 +10,7 @@ Q8_0 is unpacked exactly (int8 * fp16 scale), then quantized to q4 with the leas
 
   .venv/bin/python pc/convert_gguf.py ~/models/Qwen3-Embedding-0.6B-Q8_0.gguf [--id qwen3-embedding-0.6b]
   .venv/bin/python pc/convert_gguf.py ~/models/LFM2.5-2.6B-QAD-Q4_0.gguf [--id=lfm2.5-2.6b] [--ctx=2048]
+  .venv/bin/python pc/convert_gguf.py ~/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf --id=qwen3-4b-2507 [--ctx=4096]
       -> models/ps4/<id>/
 """
 import json
@@ -25,7 +26,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 from q4 import interleave_q4, quantize_q4_mse  # noqa: E402
 
-CHAT_SEQ = 32768  # an LFM2 context (fp16 KV cache of its 8 attention layers: 16 KiB per token, 512 MiB)
+CHAT_SEQ = 4096   # a chat model's context, unless --ctx= (fp16 KV cache: LFM2.5 16 KiB per token, Qwen3-4B 144 KiB)
 EMB_SEQ = 1024   # tokens per input (the KV cache: 28 layers x 2 x 1024 x 8 heads x 128 x fp16 = 112 MiB)
 
 
@@ -147,8 +148,9 @@ def main():
     src = Path([a for a in sys.argv[1:] if not a.startswith("--")][0]).expanduser()
     meta, tensors, mm = gguf(src)
     arch = meta["general.architecture"]
-    assert arch in ("qwen3", "lfm2"), f"{arch}: only Qwen3 (Qwen3-Embedding) and LFM2 so far"
+    assert arch in ("qwen3", "lfm2"), f"{arch}: only Qwen3 (chat or Qwen3-Embedding) and LFM2 so far"
     lfm = arch == "lfm2"
+    chat = lfm or "qwen3.pooling_type" not in meta   # (an embedding model has a pooling type)
     mid = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--id=")),
                src.stem.lower().replace("-q8_0", "").replace("-q4_k_m", "").replace("-f16", "").replace("-bf16", ""))
     out = ROOT / "models" / "ps4" / mid
@@ -187,7 +189,7 @@ def main():
             copied.append(key)
         else:
             packed, d16 = quantize_q4_mse(np.concatenate([get(n) for n in names]))
-        if lfm:   # q4i (the same values, rows in tiles of 64): the batched prompt's matrix kernels read it
+        if chat:   # q4i (the same values, rows in tiles of 64): the batched prompt's matrix kernels read it
             nib, sc = interleave_q4(packed, d16)
             put(key, nib + sc, rows=packed.shape[0], cols=packed.shape[1] * 2, scales=len(nib), fmt=3)
         else:
@@ -222,7 +224,7 @@ def main():
     # eos = the end of a turn, eos2 = the end of the text
     chat_seq = int(next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--ctx=")), CHAT_SEQ))
     assert chat_seq % 64 == 0, "--ctx: a multiple of 64 (shaders/attn.h ATT_BLOCK)"
-    ends, seq = ((toks.index("<|im_end|>"), toks.index("<|endoftext|>")), chat_seq) if lfm else ((151645, eos), EMB_SEQ)
+    ends, seq = ((toks.index("<|im_end|>"), toks.index("<|endoftext|>")), chat_seq) if chat else ((151645, eos), EMB_SEQ)
     head = struct.pack("<4s10I2f128sQI", b"PML2" if lfm else b"PMDL", n_layers, hidden, meta[A + "feed_forward_length"],
                        n_heads, n_kv, head_dim, tensors["token_embd.weight"][0][1], seq, ends[0], ends[1],
                        meta[A + "attention.layer_norm_rms_epsilon"], meta[A + "rope.freq_base"], b"weights.bin", size,
@@ -231,13 +233,13 @@ def main():
         head += struct.pack("<8I", full_mask, toks.index("<|im_start|>"), meta["tokenizer.ggml.bos_token_id"],
                             toks.index("<think>"), toks.index("</think>"), 0, 0, 0)
     (out / "model.idx").write_bytes(head + b"".join(struct.pack("<QQIIQI", *recs[k]) for k in order))
-    if not lfm:
+    if not chat:
         (out / "embedding.txt").write_text(json.dumps({"pooling": "last", "eos": eos, "max_tokens": EMB_SEQ}))
     print(f"\n{len(copied)} of {1 + 4 * n_layers} matrices copied as they are (Q4_0)")
     print(f"\n{mid}/weights.bin: {size / 2**20:.0f} MiB ({n_layers} layers, hidden {hidden}, heads {n_heads}/{n_kv} x "
           f"{head_dim})")
     tokenizer(meta, out)
-    kernels(out, [f"MAX_SEQ={seq}"] + ([f"HEAD_DIM={head_dim}", "PREFILL"] if lfm else []))
+    kernels(out, [f"MAX_SEQ={seq}"] + (["PREFILL"] if chat else []) + ([f"HEAD_DIM={head_dim}"] if head_dim != 128 else []))
 
 
 if __name__ == "__main__":

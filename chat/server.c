@@ -484,7 +484,7 @@ static int render(ServerConfig* cfg, const Request* r, uint32_t* ids, int max) {
         ids[n++] = cfg->im_start;
         n = cfg->encode(ids, n, max - 16, role_names[role]);
         n = cfg->encode(ids, n, max - 16, "\n");
-        if (role == ROLE_ASSISTANT && !(cfg->think_last && i < r->n)) {   // the empty think block: no thinking
+        if (role == ROLE_ASSISTANT && cfg->think && !(cfg->think_last && i < r->n)) {   // empty think block
             ids[n++] = cfg->think;
             if (!cfg->think_last) n = cfg->encode(ids, n, max - 16, "\n\n");
             ids[n++] = cfg->think_end;   // (LFM2.5 thinks anyway without the "\n" after it)

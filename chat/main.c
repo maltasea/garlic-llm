@@ -298,7 +298,8 @@ static void use(ServerConfig* cfg, int second) {
     Engine* e = second ? &eng2 : &eng;
     cfg->eng = e, cfg->tok = cur_tok = second ? &tok2 : &tok;
     cfg->im_start = e->im_start, cfg->im_end = e->im_end, cfg->snap = second ? 0 : main_snap;
-    cfg->think = e->think ? e->think : THINK, cfg->think_end = e->think ? e->think_end : THINK_END;
+    cfg->think = e->think ? e->think : e->qwen35 ? THINK : 0;   // (Qwen3 PMDL: no think block)
+    cfg->think_end = e->think ? e->think_end : e->qwen35 ? THINK_END : 0;
     cfg->bos = e->bos, cfg->think_last = e->lfm;
     snprintf(cfg->model, sizeof(cfg->model), "%s", second ? second_id : main_id);
 }

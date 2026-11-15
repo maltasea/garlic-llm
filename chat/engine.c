@@ -301,7 +301,7 @@ static int load_kernels(Engine* e, const char* dir) {
     static const char* pf_names[7] = {"mm_q4i_rows", "mm_q3i_rows", "rmsnorm_rows", "silu_mul_rows",
                                       "mul_sigmoid_rows", "conv_silu_rows", "delta_rows"};
     const GpuKernel** pf_k[7] = {&e->k_mm4r, &e->k_mm3r, &e->k_rmsr, &e->k_silur, &e->k_sigr, &e->k_convr, &e->k_deltar};
-    e->pf = (e->qwen35 || e->lfm) && (e->cpu_embed || e->k_embed);
+    e->pf = e->cpu_embed || e->k_embed;   // (q4i matrices and the kernels below, else token by token)
     if (e->lfm && !(e->k_shortr = kernel(e, "short_conv_rows")))
         e->pf = 0, e->error[0] = 0;   // (an older LFM2 kernels.bin: the prompt token by token)
     for (int j = 0; j < 7; j++) {
@@ -449,7 +449,11 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
     e->kargs_cap = KARGS_BYTES;
     e->label = (volatile uint32_t*)(uintptr_t)gpu_alloc(e, 256);
     e->stamps = (volatile uint64_t*)(uintptr_t)gpu_alloc(e, 256);
-    if (load_kernels(e, dir)) return -1;
+    char kp[200];   // the model folder's own kernels.bin (pc/convert_gguf.py), else the package's
+    snprintf(kp, sizeof(kp), "%s/kernels.bin", model_dir);
+    int own = open(kp, O_RDONLY);
+    if (own >= 0) close(own);
+    if (load_kernels(e, own >= 0 ? model_dir : dir)) return -1;
 
     uint32_t* init = (uint32_t*)(uintptr_t)gpu_alloc(e, 1024);
     sceGnmDrawInitDefaultHardwareState350(init, 256);
