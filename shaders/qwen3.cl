@@ -52,4 +52,150 @@ void short_conv_rows(global const float* in, global const float* w, global float
     s[0] = s0;
     s[1] = s1;
 }
+
+// Attention for `n` consecutive prompt tokens (rows) at positions pos0.., after their k and v are in the cache
+// (qk_rope_rows). Group = (kv head, AR_ROWS rows, slice of the positions): its rows x gq q heads (up to 32 queries)
+// go through its slice of the cache together, 64 positions at a time, with an online softmax: each k and v is read
+// once per group instead of once per token. The slices (`split` of them) spread a long context over the GPU; each
+// writes its unnormalised output, max and sum to part, and attn_rows_combine merges them. q rows of ldq floats (the
+// q heads first). Positions past a row's own get weight 0 (causal); past the last one written, the position is
+// clamped (the cache there may hold NaNs).
+#define AR_ROWS 8
+#define AR_Q (AR_ROWS * GQ_MAX)
+#define AR_PARTS (256 / HEAD_DIM)
+#define AR_QPT (AR_Q / AR_PARTS)
+kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void attn_rows(global const float* q, global const half_t* kcache, global const half_t* vcache, global float* part,
+               uint pos0, uint n, uint n_heads, uint n_kv, uint ldq, float scale, uint split) {
+    local float qs[AR_Q][HEAD_DIM];
+    local float s[AR_Q][ATT_BLOCK];
+    local float mq[AR_Q], lq[AR_Q], aq[AR_Q];
+    uint t = LID, lane = t & 63, qg = t >> 6, d = t % HEAD_DIM, pt = t / HEAD_DIM;
+    uint nch = (n + AR_ROWS - 1) / AR_ROWS, kv = GID % n_kv, ch = GID / n_kv % nch, sl = GID / n_kv / nch;
+    uint r0 = ch * AR_ROWS, gq = n_heads / n_kv;
+    uint nr = n - r0 < AR_ROWS ? n - r0 : AR_ROWS, nq = nr * gq, pmax = pos0 + r0 + nr - 1;
+    uint nblk = pmax / ATT_BLOCK + 1, per = (nblk + split - 1) / split;
+    uint b0 = sl * per, b1 = b0 + per < nblk ? b0 + per : nblk;
+    for (uint i = t; i < AR_Q * HEAD_DIM; i += 256) {   // query i = row * gq + head
+        uint qi = i / HEAD_DIM, dd = i % HEAD_DIM;
+        qs[qi][dd] = qi < nq ? q[(ulong)(r0 + qi / gq) * ldq + (kv * gq + qi % gq) * HEAD_DIM + dd] * scale : 0.0f;
+    }
+    if (t < AR_Q) mq[t] = -3.0e38f, lq[t] = 0.0f;
+    float o[AR_QPT];
+    for (uint i = 0; i < AR_QPT; i++) o[i] = 0.0f;
+    BARRIER();
+    for (uint bk = b0; bk < b1; bk++) {
+        uint p0 = bk * ATT_BLOCK, p = p0 + lane;
+        float a[AR_Q / 4];   // scores: lane = position, wave qg = queries qg * AR_Q / 4 ..
+        for (uint i = 0; i < AR_Q / 4; i++) a[i] = 0.0f;
+        if (p <= pmax) {
+            global const half_t* k = kcache + (ulong)kv * HEAD_DIM * MAX_SEQ + p;
+            for (uint dd = 0; dd < HEAD_DIM; dd++) {
+                float kf = (float)k[(ulong)dd * MAX_SEQ];
+                for (uint i = 0; i < AR_Q / 4; i++) a[i] += qs[qg * (AR_Q / 4) + i][dd] * kf;
+            }
+        }
+        for (uint i = 0; i < AR_Q / 4; i++) {
+            uint qi = qg * (AR_Q / 4) + i;
+            s[qi][lane] = qi < nq && p <= pos0 + r0 + qi / gq ? a[i] : -3.0e38f;
+        }
+        BARRIER();
+        if (t < nq) {   // online softmax: the new max, the weights in place, the old sum rescaled
+            float m0 = mq[t], mx = m0;
+            for (uint j = 0; j < ATT_BLOCK; j++) mx = __builtin_fmaxf(mx, s[t][j]);
+            float sum = 0.0f;
+            for (uint j = 0; j < ATT_BLOCK; j++) {
+                float e = s[t][j] > -1.0e38f ? exp_(s[t][j] - mx) : 0.0f;
+                s[t][j] = e;
+                sum += e;
+            }
+            float al = m0 > -1.0e38f ? exp_(m0 - mx) : 0.0f;
+            aq[t] = al, lq[t] = lq[t] * al + sum, mq[t] = mx;
+        }
+        BARRIER();
+        for (uint i = 0; i < AR_QPT; i++) o[i] *= aq[pt * AR_QPT + i];
+        for (uint j = 0; j < ATT_BLOCK; j++) {
+            uint pc = p0 + j <= pmax ? p0 + j : pmax;
+            float v = (float)vcache[((ulong)pc * n_kv + kv) * HEAD_DIM + d];
+            for (uint i = 0; i < AR_QPT; i++) o[i] += s[pt * AR_QPT + i][j] * v;
+        }
+        BARRIER();
+    }
+    // part: [row][q head][slice] x (HEAD_DIM outputs, then max, sum)
+    for (uint i = 0; i < AR_QPT; i++) {
+        uint qi = pt * AR_QPT + i;
+        if (qi < nq) {
+            global float* pp = part + (((ulong)(r0 + qi / gq) * n_heads + kv * gq + qi % gq) * split + sl) * (HEAD_DIM + 2);
+            pp[d] = o[i];
+            if (d == 0) pp[HEAD_DIM] = mq[qi], pp[HEAD_DIM + 1] = lq[qi];
+        }
+    }
+}
+
+// Merges attn_rows' slices: group = (row, q head), HEAD_DIM threads; out rows of n_heads * HEAD_DIM.
+kernel __attribute__((reqd_work_group_size(HEAD_DIM, 1, 1)))
+void attn_rows_combine(global const float* part, global float* out, uint split) {
+    global const float* pp = part + (ulong)GID * split * (HEAD_DIM + 2);
+    float m = -3.0e38f;
+    for (uint k = 0; k < split; k++) m = __builtin_fmaxf(m, pp[k * (HEAD_DIM + 2) + HEAD_DIM]);
+    float o = 0.0f, sum = 0.0f;
+    for (uint k = 0; k < split; k++) {
+        global const float* x = pp + k * (HEAD_DIM + 2);
+        float w = x[HEAD_DIM] > -1.0e38f ? exp_(x[HEAD_DIM] - m) : 0.0f;
+        o += w * x[LID];
+        sum += w * x[HEAD_DIM + 1];
+    }
+    out[(ulong)GID * HEAD_DIM + LID] = o / sum;
+}
+
+// qk_rope_cache (attn.h) for `n` consecutive rows in one dispatch: group = row * (n_heads + 2 n_kv) + g, row r at
+// position pos0 + r, its q | k | v at qkv + r * ldq. (Plain cache only: no ATTN_SPLIT, no V_INT8.)
+kernel __attribute__((reqd_work_group_size(64, 1, 1)))
+void qk_rope_rows(global float* qkv, global const float* q_norm, global const float* k_norm, global const float* rope,
+                  global half_t* kcache, global half_t* vcache, uint pos0, uint n_heads, uint n_kv, float eps,
+                  uint ldq) {
+    local float red[64];
+    local float hv[HEAD_DIM];
+    uint G = n_heads + 2 * n_kv, r = GID / G, g = GID % G, j = LID, pos = pos0 + r;
+    qkv += (ulong)r * ldq;
+    if (g < n_heads + n_kv) {
+        global float* h = qkv + g * HEAD_DIM;
+        float x[EPT];
+        float ss = 0.0f;
+        for (uint m = 0; m < EPT; m++) {
+            x[m] = h[j + 64 * m];
+            ss += x[m] * x[m];
+        }
+        red[j] = ss;
+        BARRIER();
+        for (uint s = 32; s > 0; s >>= 1) {
+            if (j < s) red[j] += red[j + s];
+            BARRIER();
+        }
+        float rr = rsq(red[0] / (float)HEAD_DIM + eps);
+        global const float* w = g < n_heads ? q_norm : k_norm;
+        for (uint m = 0; m < EPT; m++) {
+            x[m] *= rr * w[j + 64 * m];
+            hv[j + 64 * m] = x[m];
+        }
+        BARRIER();
+        const uint rh = ROPE_DIM / 2;
+        global const float* rp = rope + (ulong)pos * ROPE_DIM;
+        for (uint m = 0; m < EPT; m++) {
+            uint i = j + 64 * m;
+            float y = x[m];
+            if (i < ROPE_DIM) {
+                float c = rp[i % rh], sn = rp[rh + i % rh];
+                y = i < rh ? y * c - hv[i + rh] * sn : y * c + hv[i - rh] * sn;
+            }
+            if (g < n_heads) h[i] = y;
+            else kcache[((ulong)(g - n_heads) * HEAD_DIM + i) * MAX_SEQ + pos] = (half_t)y;
+        }
+    } else {
+        uint kv = g - n_heads - n_kv;
+        global const float* v = qkv + (n_heads + n_kv + kv) * HEAD_DIM;
+        global half_t* dst = vcache + ((ulong)pos * n_kv + kv) * HEAD_DIM;
+        for (uint m = 0; m < EPT; m++) dst[j + 64 * m] = (half_t)v[j + 64 * m];
+    }
+}
 #endif

@@ -304,6 +304,20 @@ static int load_kernels(Engine* e, const char* dir) {
     e->pf = e->cpu_embed || e->k_embed;   // (q4i matrices and the kernels below, else token by token)
     if (e->lfm && !(e->k_shortr = kernel(e, "short_conv_rows")))
         e->pf = 0, e->error[0] = 0;   // (an older LFM2 kernels.bin: the prompt token by token)
+    e->k_attnr = e->k_attnrc = e->k_qkr = NULL;   // (optional: else the attention token by token)
+    for (int i = 0; !e->qwen35 && i < e->nk; i++) {
+        if (!strcmp(e->k[i].name, "attn_rows")) e->k_attnr = &e->k[i];
+        if (!strcmp(e->k[i].name, "attn_rows_combine")) e->k_attnrc = &e->k[i];
+        if (!strcmp(e->k[i].name, "qk_rope_rows")) e->k_qkr = &e->k[i];
+    }
+    if (!e->k_qkr || !e->k_attnrc) e->k_attnr = NULL;
+    {   // /data/garlic_rows.txt = 0: the prompt's attention token by token (to compare)
+        size_t fs;
+        char* sw = (char*)read_file("/data/garlic_rows.txt", &fs);
+        if (sw && fs && sw[0] == '0') e->k_attnr = NULL;
+        free(sw);
+    }
+    if (!e->qwen35) say("prompt attention: %s", e->k_attnr ? "all rows at once (attn_rows)" : "token by token");
     for (int j = 0; j < 7; j++) {
         *pf_k[j] = NULL;
         for (int i = 0; i < e->nk; i++)
@@ -527,7 +541,9 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
     e->attn = gpu_alloc(e, (uint64_t)(e->n_heads * e->head_dim > e->n_vh * e->dv ? e->n_heads * e->head_dim
                                                                                   : e->n_vh * e->dv) * 4);
     if (!(e->qwen35 && e->tq))
-        e->attn_part = gpu_alloc(e, (uint64_t)e->n_heads * (e->max_seq / ATT_BLOCK) * (e->head_dim + 2) * 4);
+        e->attn_part = gpu_alloc(e, (uint64_t)e->n_heads *   // (also attn_rows' PF_ROWS rows x 8 slices)
+                                        (e->max_seq / ATT_BLOCK > PF_ROWS * 8 ? e->max_seq / ATT_BLOCK : PF_ROWS * 8) *
+                                        (e->head_dim + 2) * 4);
     e->hmlp = gpu_alloc(e, e->inter * 4);
     e->bsum = gpu_alloc(e, (uint64_t)(e->inter > e->hidden ? e->inter : e->hidden) / 32 * 4 + 4096);
     uint32_t stage_rows = STEPS_PER_SUBMIT;
@@ -1006,7 +1022,13 @@ static void prefill(Engine* e, uint64_t stage, const uint32_t* tokens, uint32_t 
             uint32_t ld = e->t[b + 4].rows, nq = e->n_heads * e->head_dim, G = e->n_heads + 2 * e->n_kv;
             double sc = 1.0 / sqrt((double)e->head_dim);
             mmr(e, b + 4, e->pf_xn, e->pf_a, n, 0);
-            for (uint32_t r = 0; r < n; r++) {
+            int rows = !e->tq && !e->qwen35 && e->k_attnr;   // all the rows together: each k and v read once
+            if (rows)
+                dispatch(e, e->k_qkr,
+                         args(e, "ppppppuuufu", e->pf_a, W(e, b + 2), W(e, b + 3), e->rope, kc, vc, pos0, e->n_heads,
+                              e->n_kv, (double)e->eps, ld),
+                         n * G, 64);
+            for (uint32_t r = 0; r < n && !rows; r++) {
                 uint64_t q = e->pf_a + (uint64_t)r * ld * 4;
                 if (e->tq)
                     dispatch(e, e->k_qk_tq,
@@ -1024,7 +1046,14 @@ static void prefill(Engine* e, uint64_t stage, const uint32_t* tokens, uint32_t 
                                   e->n_kv, (double)e->eps),
                              G, 64);
             }
-            for (uint32_t r = 0; r < n; r++) {   // token r sees positions up to its own (all written above)
+            if (rows) {   // positions in up to 8 slices (attn_part holds rows x heads x 8 slices), then merged
+                uint32_t blocks = (pos0 + n - 1) / ATT_BLOCK + 1, split = blocks < 8 ? blocks : 8;
+                dispatch(e, e->k_attnr, args(e, "ppppuuuuufu", e->pf_a, kc, vc, e->attn_part, pos0, n, e->n_heads,
+                                             e->n_kv, ld, sc, split),
+                         e->n_kv * ((n + 7) / 8) * split, 256);
+                dispatch(e, e->k_attnrc, args(e, "ppu", e->attn_part, e->pf_h, split), n * e->n_heads, e->head_dim);
+            }
+            for (uint32_t r = 0; r < n && !rows; r++) {   // token r sees positions up to its own (all written above)
                 uint64_t q = e->pf_a + (uint64_t)r * ld * 4, out = e->pf_h + (uint64_t)r * nq * 4;
                 uint32_t pos = pos0 + r, blocks = pos / ATT_BLOCK + 1;
                 if (e->tq) {

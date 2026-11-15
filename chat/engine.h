@@ -85,6 +85,7 @@ typedef struct {
     uint64_t pf_x, pf_xn, pf_a, pf_h;
     const GpuKernel *k_mm4r, *k_mm3r, *k_rmsr, *k_silur, *k_sigr, *k_convr, *k_deltar;
     const GpuKernel* k_shortr;   // LFM2: short_conv_rows
+    const GpuKernel *k_attnr, *k_attnrc, *k_qkr;   // PMDL / PML2: the prompt's attention, all rows at once
     double pf_seconds;            // GPU time of the last batched prompt (diagnostics)
     uint64_t submit_tsc;          // when the last submission went to the GPU (submit_go)
     // the fastest product kernel for each matrix shape, timed at start-up (engine.c mm_tune): [0] for batches of
