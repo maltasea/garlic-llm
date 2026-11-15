@@ -200,6 +200,9 @@ static int server_frame(void* user, const ServerStatus* st) {
     } else if (!st->busy) {
         sceKernelUsleep(20000);
     }
+    static uint64_t tick;   // as a video player: the console does not go to rest mode while the server runs
+    uint64_t now = sceKernelGetProcessTime();
+    if (now - tick > 10000000) tick = now, sceSystemServicePowerTick();
     return 0;   // the server runs until the app is closed
 }
 

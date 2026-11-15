@@ -525,6 +525,7 @@ int engine_spec_step(Engine* e, uint32_t tok, int pos, float temperature, uint32
     }
     volatile uint32_t* st = ST();
     uint32_t K = st[ST_STOP] && st[ST_K] == 0 ? 0 : st[ST_K];
+    if (K > SPEC_KMAX) K = SPEC_KMAX;   // (a count from the GPU: never past d[])
     int room = (int)e->ctx_limit - pos - 1;
     if ((int)K > room) K = room < 0 ? 0 : (uint32_t)room;
     if ((int)K > max_new - 1) K = max_new > 1 ? (uint32_t)(max_new - 1) : 0;

@@ -173,8 +173,23 @@ static void reply_error(int fd, int code, const char* type, const char* message)
 }
 
 // A model the server can load: MODEL_ID, or a folder of MODELS_DIR with a model.idx (a plain name: no '/', no '.')
+// The built-in model is there when the weights file its idx names is (moved away: neither listed nor loaded)
+static int builtin_exists(void) {
+    char path[129] = "";
+    int f = open("/app0/assets/model.idx", O_RDONLY);
+    if (f >= 0) pread(f, path, 128, 52), close(f);
+    path[128] = 0;
+    const char* base = strrchr(path, '/');
+    char in_pkg[160];   // (a full build has it in the package, as engine.c weights_locate)
+    snprintf(in_pkg, sizeof(in_pkg), "/app0/models/%s", base ? base + 1 : path);
+    int w = open(path, O_RDONLY);
+    if (w < 0) w = open(in_pkg, O_RDONLY);
+    if (w >= 0) close(w);
+    return w >= 0;
+}
+
 static int model_exists(const char* id) {
-    if (!strcmp(id, MODEL_ID)) return 1;
+    if (!strcmp(id, MODEL_ID)) return builtin_exists();
     if (!*id || strlen(id) > 48 || strchr(id, '/') || id[0] == '.') return 0;
     char p[128];
     snprintf(p, sizeof(p), MODELS_DIR "/%s/model.idx", id);
@@ -196,7 +211,7 @@ static void models(ServerConfig* cfg, int fd) {
     int first = 1;
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     model_entry(&b, cfg->model, &first);
-    if (strcmp(cfg->model, MODEL_ID)) model_entry(&b, MODEL_ID, &first);
+    if (strcmp(cfg->model, MODEL_ID) && builtin_exists()) model_entry(&b, MODEL_ID, &first);
     if (cfg->embed_model[0]) model_entry(&b, cfg->embed_model, &first);
     DIR* d = opendir(MODELS_DIR);
     for (struct dirent* x; d && (x = readdir(d));)
