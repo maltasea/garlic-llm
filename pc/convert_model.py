@@ -6,7 +6,8 @@
 All q4 (pc/q4.py), no q3. Needs numpy only; reads the safetensors files with numpy.memmap.
 
   .venv/bin/python pc/convert_model.py models/Qwen3.5-2B [--id qwen3.5-2b]    -> models/ps4/<id>/
-  .venv/bin/python pc/convert_model.py ~/models/Qwen3.5-4B-UD-Q6_K_XL.gguf --id=qwen3.5-4b   (a GGUF: GGUFCheckpoint)
+  .venv/bin/python pc/convert_model.py ~/models/Qwen3.5-4B-Q5_K_M.gguf --id=qwen3.5-4b [--mtp=models/Qwen3.5-4B-mtp]
+      (a GGUF: GGUFCheckpoint; its MTP head from pc/fetch_mtp.py)
 """
 import json
 import struct
@@ -151,6 +152,19 @@ class GGUFCheckpoint:
         return w
 
 
+class Both:
+    """Tensors from a, else from b."""
+
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+    def __contains__(self, name):
+        return name in self.a or name in self.b
+
+    def __getitem__(self, name):
+        return self.a[name] if name in self.a else self.b[name]
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     src = Path(args[0]).expanduser()
@@ -160,6 +174,10 @@ def main():
     if src.suffix == ".gguf":
         ck = GGUFCheckpoint(src)
         c = ck.config
+        mtp_dir = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--mtp=")), None)
+        if mtp_dir:   # the MTP head from pc/fetch_mtp.py's folder, the rest from the GGUF
+            ck = Both(Checkpoint(Path(mtp_dir).expanduser()), ck)
+            c = dict(c, mtp_num_hidden_layers=1)
     else:
         cfg = json.loads((src / "config.json").read_text())
         c = cfg.get("text_config", cfg)
