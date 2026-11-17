@@ -4,7 +4,7 @@ model; LFM2 is a chat model ("PML2": its short-conv layers, 64-dim heads, a CHAT
   weights.bin   PMDL; the embedder's matrices in q8 (fmt 9: GGUF's Q8_0 values as they are), a chat model's in q4;
                 tied embedding, no lm_head of its own
   model.idx     PMDL, MAX_SEQ (the longest input) = EMB_SEQ, the weights a bare name: the folder's weights.bin
-  kernels.bin   shaders/qwen3.cl with MAX_SEQ = EMB_SEQ (head_dim 128)
+  kernels.bin   shaders/qwen3.cl with MAX_SEQ = EMB_SEQ (head_dim 128) and the batched prompt (PREFILL)
   tokenizer.bin from the GGUF's vocabulary and merges (as pc/export_chat.py export_tokenizer)
   embedding.txt "last": pooling (the final norm's output at the last token, then L2 norm); marks the folder
 A chat model's matrices: Q8_0 is unpacked exactly (int8 * fp16 scale), then quantized to q4 with the least-error scale
@@ -263,7 +263,7 @@ def main():
     print(f"\n{mid}/weights.bin: {size / 2**20:.0f} MiB ({n_layers} layers, hidden {hidden}, heads {n_heads}/{n_kv} x "
           f"{head_dim})")
     tokenizer(meta, out)
-    kernels(out, [f"MAX_SEQ={seq}"] + (["PREFILL"] if chat else []) + ([f"HEAD_DIM={head_dim}"] if head_dim != 128 else []))
+    kernels(out, [f"MAX_SEQ={seq}", "PREFILL"] + ([f"HEAD_DIM={head_dim}"] if head_dim != 128 else []))
 
 
 if __name__ == "__main__":

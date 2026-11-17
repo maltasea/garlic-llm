@@ -76,10 +76,52 @@ void short_conv(global float* in, global const float* w, global float* state, ui
     s[1] = bx;
 }
 
-#ifdef PREFILL   // LFM2: the prompt in batches (chat/engine.c prefill; the DeltaNet kernels there go unused)
+#ifdef PREFILL   // LFM2, Qwen3: the prompt in batches (chat/engine.c prefill; the DeltaNet kernels there go unused)
 #define DK 128
 #define DV 128
 #include "prefill.h"
+
+// mm_q4i_rows (prefill.h) for q8 weights (fmt 9, rows as they are): lane = output row of the tile, its 32 int8 of
+// block b and their scale; the same group shape (64 rows x MM_ROWS tokens), sums and stores.
+kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void mm_q8_rows(global const uchar* restrict w, global const ushort* restrict sc, global const float* restrict X,
+                global float* restrict Y, uint cols, uint rows, uint n, uint accumulate) {
+    local float part[4][MM_ROWS][64];
+    uint l = LID & 63, nb = cols / 32, nch = (n + MM_ROWS - 1) / MM_ROWS;
+    uint wv = __builtin_amdgcn_readfirstlane(LID >> 6);
+    uint tile = GID / nch, r0 = (GID % nch) * MM_ROWS;
+    uint nv = n - r0 < MM_ROWS ? n - r0 : MM_ROWS;
+    ulong row = (ulong)tile * 64 + l;
+    global const uint4v* wp = (global const uint4v*)(w + row * cols);
+    global const ushort* sp = sc + row * nb;
+    global const float* x0 = X + (ulong)r0 * cols;
+    float acc[MM_ROWS];
+    for (uint v = 0; v < MM_ROWS; v++) acc[v] = 0.0f;
+    for (uint b = wv; b < nb; b += 4) {
+        uint4v qa = wp[2 * b], qb = wp[2 * b + 1];
+        float d = h2f(sp[b]);
+        uint ws[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+        float wf[32];
+        for (uint k = 0; k < 8; k++)
+            for (uint j = 0; j < 4; j++) wf[4 * k + j] = (float)((int)(ws[k] << (24 - 8 * j)) >> 24) * d;
+#pragma unroll
+        for (uint v = 0; v < MM_ROWS; v++) {
+            if (v < nv) {
+                global const float* xb = x0 + (ulong)v * cols + b * 32;
+                float s = 0.0f;
+                for (uint j = 0; j < 32; j++) s += wf[j] * xb[j];
+                acc[v] += s;
+            }
+        }
+    }
+    for (uint v = 0; v < MM_ROWS; v++) part[wv][v][l] = acc[v];
+    BARRIER();
+    for (uint v = wv; v < nv; v += 4) {
+        float r = part[0][v][l] + part[1][v][l] + part[2][v][l] + part[3][v][l];
+        global float* y = Y + (ulong)(r0 + v) * rows + tile * 64 + l;
+        *y = accumulate ? *y + r : r;
+    }
+}
 
 // short_conv for `rows` consecutive tokens: in rows of 3n (B | C | x), out rows of n; the state stays in registers.
 kernel __attribute__((reqd_work_group_size(256, 1, 1)))

@@ -325,6 +325,10 @@ static int load_kernels(Engine* e, const char* dir) {
             if (!strcmp(e->k[i].name, pf_names[j])) *pf_k[j] = &e->k[i];
         if (!*pf_k[j]) e->pf = 0;
     }
+    e->k_mm8r = NULL;   // (q8 matrices: their batched product, else the prompt token by token)
+    for (int i = 0; e->q8 && i < e->nk; i++)
+        if (!strcmp(e->k[i].name, "mm_q8_rows")) e->k_mm8r = &e->k[i];
+    if (e->q8 && !e->k_mm8r) e->pf = 0;
     {   // /data/garlic_pf.txt = 0: the prompt token by token again, without rebuilding (the context stays)
         size_t fs;
         char* sw = (char*)read_file("/data/garlic_pf.txt", &fs);
@@ -582,7 +586,7 @@ int engine_load(Engine* e, const char* dir, const char* model_dir, ProgressFn pr
         for (int j = 0; j < 4; j++) {
             const Tensor* t = &e->t[m[j]];
             int sw = t->fmt == 6 || t->fmt == 8;
-            if ((t->fmt != 3 && t->fmt != 5 && !sw) || t->rows % (sw ? 128 : 64) || t->cols % 32)
+            if ((t->fmt != 3 && t->fmt != 5 && t->fmt != 9 && !sw) || t->rows % (sw ? 128 : 64) || t->cols % 32)
                 e->pf = 0;
             if (!(j & 1) && t->rows > pf_wa) pf_wa = t->rows;   // input projection, gate|up: rows out
             if ((j & 1) && t->cols > pf_wh) pf_wh = t->cols;    // o / out projection, down: columns in
@@ -983,7 +987,7 @@ static void mmr(Engine* e, uint32_t idx, uint64_t X, uint64_t Y, uint32_t n, uin
             mm_with(e, e->pf_mm[i].k[s], e->pf_mm[i].r[s], idx, X, Y, n, accumulate);
             return;
         }
-    mm_with(e, t->fmt == 5 ? e->k_mm3r : e->k_mm4r, 16, idx, X, Y, n, accumulate);
+    mm_with(e, t->fmt == 9 ? e->k_mm8r : t->fmt == 5 ? e->k_mm3r : e->k_mm4r, 16, idx, X, Y, n, accumulate);
 }
 
 // n (<= PF_ROWS) tokens at positions pos0.., their embedding rows at `stage` (the CPU put them there, cpu_embed) or
@@ -1348,7 +1352,7 @@ static void mm_tune(Engine* e) {
         uint32_t m[4] = {b + (full ? 4 : 2), b + (full ? 5 : 7), b + (full ? 6 : 8), b + (full ? 7 : 9)};
         for (int j = 0; j < 4 && e->pf_nmm < 8; j++) {
             const Tensor* t = &e->t[m[j]];
-            if (t->fmt == 6 || t->fmt == 8) continue;   // (q4s / q3s: swar_tune)
+            if (t->fmt == 6 || t->fmt == 8 || t->fmt == 9) continue;   // (q4s / q3s: swar_tune; q8: one kernel)
             int seen = 0;
             for (int s = 0; s < e->pf_nmm; s++)
                 seen |= e->pf_mm[s].fmt == t->fmt && e->pf_mm[s].rows == t->rows && e->pf_mm[s].cols == t->cols;

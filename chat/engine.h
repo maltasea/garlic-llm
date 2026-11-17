@@ -101,7 +101,7 @@ typedef struct {
     const GpuKernel *k_bsum, *k_mvi, *k_mvi8;    // interleaved Q4 ("q4i", fmt 3) matrices
     const GpuKernel *k_mv3, *k_mv38, *k_copy;    // interleaved Q3 ("q3i", fmt 5); staging row -> x
     int q8;                                      // q8 matrices (fmt 9, the embedder): matvec_q8
-    const GpuKernel* k_mv8;
+    const GpuKernel *k_mv8, *k_mm8r;             // (k_mm8r: the batched prompt's product, mm_q8_rows)
     uint64_t bsum;                               // block sums of the current matrix-vector input
     // SWAR int4 x int8 products ("q4s", fmt 6; shaders/spec.h): the activations in int8 per block of 32 (x8, dx,
     // init) for up to PF_ROWS rows, the split-K partial sums, and per matrix shape and number of tokens (1..4) the
