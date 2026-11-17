@@ -14,6 +14,54 @@
 #include "common.h"
 #include "attn.h"
 
+// ---- 8-bit weights ("q8", fmt 9: the embedder, pc/convert_gguf.py) -----------------------------------------------
+// GGUF's Q8_0 values as they are: per row cols int8, then (separately) one fp16 scale per block of 32
+// [rows][cols / 32]; w = q * d.
+
+// y = W x for 4 rows per 64-thread group; a lane takes 16 weights (half a block) at a time, so a row of 1024 keeps
+// all 64 lanes busy.
+kernel __attribute__((reqd_work_group_size(64, 1, 1)))
+void matvec_q8(global const uchar* w, global const ushort* scales, global const float* x, global float* y,
+               uint cols) {
+    local float red[4][64];
+    uint lane = LID, r0 = GID * 4, nb = cols / 32;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint h = lane; h < cols / 16; h += 64) {
+        float xh[16];
+        global const float4v* xv = (global const float4v*)(x + h * 16);
+        for (uint k = 0; k < 4; k++) {
+            float4v v = xv[k];
+            xh[4 * k] = v.x; xh[4 * k + 1] = v.y; xh[4 * k + 2] = v.z; xh[4 * k + 3] = v.w;
+        }
+        for (uint r = 0; r < 4; r++) {
+            ulong row = r0 + r;
+            uint4v q = *(global const uint4v*)(w + row * cols + h * 16);
+            uint words[4] = {q.x, q.y, q.z, q.w};
+            float s = 0.0f;
+            for (uint k = 0; k < 4; k++)
+                for (uint b = 0; b < 4; b++) s += (float)((int)(words[k] << (24 - 8 * b)) >> 24) * xh[4 * k + b];
+            acc[r] += h2f(scales[row * nb + h / 2]) * s;
+        }
+    }
+    for (uint r = 0; r < 4; r++) red[r][lane] = acc[r];
+    BARRIER();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (lane < s)
+            for (uint r = 0; r < 4; r++) red[r][lane] += red[r][lane + s];
+        BARRIER();
+    }
+    if (lane < 4) y[r0 + lane] = red[lane][0];
+}
+
+// x = dequantized row `token` of a q8 embedding (token from `forced` or the last pick).
+kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void embed_q8(global const schar* w, global const ushort* scales, global const uint* last, uint forced,
+              global float* x, uint cols) {
+    uint tok = forced != NO_TOKEN ? forced : *last;
+    ulong row = (ulong)tok * cols;
+    for (uint i = LID; i < cols; i += 256) x[i] = (float)w[row + i] * h2f(scales[(row + i) >> 5]);
+}
+
 // LFM2's short convolution, in place: in = B | C | x (n channels each) -> in[0, n) = C * (w0 s0 + w1 s1 + w2 B x);
 // the state keeps the last 2 B x per channel. w: [n][3]; state: [n][2] (zero at the start of a conversation).
 kernel __attribute__((reqd_work_group_size(256, 1, 1)))

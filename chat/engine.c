@@ -238,7 +238,8 @@ static int load_kernels(Engine* e, const char* dir) {
     }
     free(d);
     int q4i = e->t[0].fmt == 3 || e->t[0].fmt == 4;   // the embedding's format tells the layout of the file
-    e->k_embed = kernel(e, q4i ? "embed_q4i" : "embed_q4");
+    e->k_embed = kernel(e, q4i ? "embed_q4i" : e->t[0].fmt == 9 ? "embed_q8" : "embed_q4");
+    if (e->q8 && !(e->k_mv8 = kernel(e, "matvec_q8"))) return -1;   // (the embedder: shaders/qwen3.cl)
     if (q4i) {
         e->k_bsum = kernel(e, "block_sums");
         e->k_mvi = kernel(e, "matvec_q4i");
@@ -393,6 +394,7 @@ static int load_index(Engine* e, const char* dir) {
         memcpy(&e->t[i].scales, r + 24, 8);
         memcpy(&e->t[i].fmt, r + 32, 4);
         if (e->t[i].fmt == 6 || e->t[i].fmt == 8) e->swar = 1;   // q4s / q3s matrices: SWAR products (spec.h)
+        if (e->t[i].fmt == 9) e->q8 = 1;
     }
     free(d);
     e->head_idx = e->has_head ? e->n_tensors - 1 - vocab_map : 0;
@@ -855,7 +857,7 @@ static void matvec(Engine* e, uint32_t idx, uint64_t x, uint64_t y) {
         dispatch(e, k, args(e, "pppppu", w, w + t->scales, x, e->bsum, y, t->cols), t->rows / 64, 64 * waves);
         return;
     }
-    dispatch(e, e->k_mv, args(e, "ppppu", w, w + t->scales, x, y, t->cols), t->rows / 4, 64);
+    dispatch(e, t->fmt == 9 ? e->k_mv8 : e->k_mv, args(e, "ppppu", w, w + t->scales, x, y, t->cols), t->rows / 4, 64);
 }
 
 static void step(Engine* e, uint32_t pos, uint32_t forced, uint32_t slot, int sample, float inv_temp,

@@ -1,12 +1,15 @@
 """A Qwen3 model (chat, or Qwen3-Embedding) or an LFM2 chat model (LFM2.5) in GGUF (F32 / F16 / BF16 / Q8_0 / K-quants)
 -> a model folder for the PS4 (chat/server.h MODELS_DIR). The embedder is served at /v1/embeddings next to the chat
 model; LFM2 is a chat model ("PML2": its short-conv layers, 64-dim heads, a CHAT_SEQ context):
-  weights.bin   as pc/convert_qwen3.py --q4 (PMDL; every matrix q4, tied embedding, no lm_head of its own)
+  weights.bin   PMDL; the embedder's matrices in q8 (fmt 9: GGUF's Q8_0 values as they are), a chat model's in q4;
+                tied embedding, no lm_head of its own
   model.idx     PMDL, MAX_SEQ (the longest input) = EMB_SEQ, the weights a bare name: the folder's weights.bin
   kernels.bin   shaders/qwen3.cl with MAX_SEQ = EMB_SEQ (head_dim 128)
   tokenizer.bin from the GGUF's vocabulary and merges (as pc/export_chat.py export_tokenizer)
   embedding.txt "last": pooling (the final norm's output at the last token, then L2 norm); marks the folder
-Q8_0 is unpacked exactly (int8 * fp16 scale), then quantized to q4 with the least-error scale per block (pc/q4.py quantize_q4_mse).
+A chat model's matrices: Q8_0 is unpacked exactly (int8 * fp16 scale), then quantized to q4 with the least-error scale
+per block (pc/q4.py quantize_q4_mse). The embedder's: Q8_0 copied (int8 rows, then the fp16 scales), anything else
+quantized to Q8_0 as llama.cpp does (d = max |w| / 127).
 
   .venv/bin/python pc/convert_gguf.py ~/models/Qwen3-Embedding-0.6B-Q8_0.gguf [--id qwen3-embedding-0.6b]
   .venv/bin/python pc/convert_gguf.py ~/models/LFM2.5-2.6B-QAD-Q4_0.gguf [--id=lfm2.5-2.6b] [--ctx=2048]
@@ -27,7 +30,7 @@ sys.path.insert(0, str(HERE))
 from q4 import interleave_q4, quantize_q4_mse  # noqa: E402
 
 CHAT_SEQ = 4096   # a chat model's context, unless --ctx= (fp16 KV cache: LFM2.5 16 KiB per token, Qwen3-4B 144 KiB)
-EMB_SEQ = 1024   # tokens per input (the KV cache: 28 layers x 2 x 1024 x 8 heads x 128 x fp16 = 112 MiB)
+EMB_SEQ = 2048   # tokens per input (the KV cache: 28 layers x 2 x 2048 x 8 heads x 128 x fp16 = 224 MiB)
 
 
 def gguf(path):
@@ -196,7 +199,28 @@ def main():
             put(key, packed.tobytes() + d16.tobytes(), rows=packed.shape[0], cols=packed.shape[1] * 2,
                 scales=packed.nbytes, fmt=2)
 
-    q4("embed", "token_embd.weight")
+    def q8(key, *names):
+        """The rows of these tensors in q8 (fmt 9): int8 [rows][cols], then fp16 scales [rows][cols / 32]."""
+        qs, ds = [], []
+        for n in names:
+            (cols, rows), ty, off = tensors[n]
+            if ty == 8:   # Q8_0: blocks of 34 bytes, fp16 d then 32 int8
+                b = mm[off:off + rows * cols // 32 * 34].reshape(rows, cols // 32, 34)
+                qs.append(b[..., 2:].reshape(rows, cols)), ds.append(b[..., :2].copy().view(np.float16)[..., 0])
+            else:
+                b = get(n).reshape(rows, cols // 32, 32)
+                d = np.abs(b).max(axis=2, keepdims=True) / 127
+                q = np.rint(np.divide(b, d, out=np.zeros_like(b), where=d > 0))
+                qs.append(q.astype(np.int8).view(np.uint8).reshape(rows, cols))
+                d = d[..., 0]
+                ds.append(d.astype(np.float16))
+        q, d16 = np.concatenate(qs), np.concatenate(ds)
+        if all(tensors[n][1] == 8 for n in names):
+            copied.append(key)
+        put(key, q.tobytes() + d16.tobytes(), rows=q.shape[0], cols=q.shape[1], scales=q.nbytes, fmt=9)
+
+    mat = q4 if chat else q8   # (the embedder in 8 bits: its vectors as llama.cpp gives them from the Q8_0 GGUF)
+    mat("embed", "token_embd.weight")
     f32("final_norm", get("token_embd_norm.weight" if lfm else "output_norm.weight"))
     order = ["embed", "final_norm"]
     for i in range(n_layers):
@@ -206,15 +230,15 @@ def main():
         if kvs[i]:
             f32(f"{i}.q_norm", get(p + "attn_q_norm.weight"))
             f32(f"{i}.k_norm", get(p + "attn_k_norm.weight"))
-            q4(f"{i}.wqkv", p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight")
-            q4(f"{i}.wo", p + "attn_output.weight")
+            mat(f"{i}.wqkv", p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight")
+            mat(f"{i}.wo", p + "attn_output.weight")
         else:   # LFM2 short conv, in the same 8 slots: conv weight [hidden][3], (empty), in_proj (B | C | x), out_proj
             f32(f"{i}.q_norm", get(p + "shortconv.conv.weight"))
             f32(f"{i}.k_norm", np.zeros(64))
-            q4(f"{i}.wqkv", p + "shortconv.in_proj.weight")
-            q4(f"{i}.wo", p + "shortconv.out_proj.weight")
-        q4(f"{i}.wgu", p + "ffn_gate.weight", p + "ffn_up.weight")
-        q4(f"{i}.wdown", p + "ffn_down.weight")
+            mat(f"{i}.wqkv", p + "shortconv.in_proj.weight")
+            mat(f"{i}.wo", p + "shortconv.out_proj.weight")
+        mat(f"{i}.wgu", p + "ffn_gate.weight", p + "ffn_up.weight")
+        mat(f"{i}.wdown", p + "ffn_down.weight")
         order += [f"{i}.{k}" for k in ("attn_norm", "mlp_norm", "q_norm", "k_norm", "wqkv", "wo", "wgu", "wdown")]
         print(f"layer {i}: {w.tell() / 2**20:.0f} MiB", end="\r", flush=True)
     size = w.tell()
@@ -235,7 +259,7 @@ def main():
     (out / "model.idx").write_bytes(head + b"".join(struct.pack("<QQIIQI", *recs[k]) for k in order))
     if not chat:
         (out / "embedding.txt").write_text(json.dumps({"pooling": "last", "eos": eos, "max_tokens": EMB_SEQ}))
-    print(f"\n{len(copied)} of {1 + 4 * n_layers} matrices copied as they are (Q4_0)")
+    print(f"\n{len(copied)} of {1 + 4 * n_layers} matrices copied as they are ({'Q4_0' if chat else 'Q8_0'})")
     print(f"\n{mid}/weights.bin: {size / 2**20:.0f} MiB ({n_layers} layers, hidden {hidden}, heads {n_heads}/{n_kv} x "
           f"{head_dim})")
     tokenizer(meta, out)
